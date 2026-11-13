@@ -117,6 +117,10 @@ Without installing:
 uv run mtm
 ```
 
+The layout adapts to the terminal: below 150 columns the system panel and inspector move under
+the table, less important columns are dropped as space runs out, and charts are hidden below 36
+rows. It's usable down to 80×24; the full view wants about 190 columns.
+
 Run from an elevated terminal (or as root on Linux) to inspect processes owned by other users
 and services; otherwise those show "access denied" in the inspector but still appear in the table.
 

@@ -123,6 +123,19 @@ async def tui_checks() -> None:
         check(app.filter_text == "" and len(app.rows) > len(names), "Esc clears the filter")
 
 
+async def small_terminal_checks() -> None:
+    from memtaskman.app import MemTaskManApp
+
+    app = MemTaskManApp(interval=0.5)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await pilot.pause(2.5)
+        side = app.query_one("#side")
+        table = app.query_one("#procs")
+        check(app.screen.has_class("narrow") and side.region.y < 24 and side.region.height > 2,
+              f"80x24: side panel below the table at row {side.region.y}")
+        check(table.region.width <= 80 and app.compact_cols == 3, f"80x24: compact columns (tier {app.compact_cols})")
+
+
 def run(*args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ, PYTHONUTF8="1")
     return subprocess.run([sys.executable, "-m", "memtaskman", *args], capture_output=True, text=True,
@@ -158,6 +171,7 @@ def main() -> int:
     print(f"platform {sys.platform}, python {sys.version.split()[0]}")
     collector_checks()
     asyncio.run(tui_checks())
+    asyncio.run(small_terminal_checks())
     cli_checks()
     print(f"\n{len(FAILURES)} failure(s)")
     return 1 if FAILURES else 0

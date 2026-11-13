@@ -33,6 +33,13 @@ from memtaskman.model import (
 )
 
 HISTORY = 120
+SIDE_W = 65  # side panel width incl. border
+NARROW_W = 150  # below this the side panel moves under the table
+# Column tiers chosen from the width left for the table (cells include 2 columns of padding):
+FULL_COLS_W = 128  # tier 0: all columns
+MID_COLS_W = 104  # tier 1: drop Faults/s and Pool/Swap, shorter Runtime
+SMALL_COLS_W = 92  # tier 2: also shorter Name and Runtime; below (tier 3): also drop PSS/PrivWS
+SHORT_H = 36  # below this the charts are hidden
 TOP_N = 50
 INSPECT_EVERY = 5.0
 
@@ -167,6 +174,11 @@ class MemTaskManApp(App):
     #system { height: auto; padding: 0 1; }
     #inspector { height: 1fr; padding: 0 1; }
     .slim #charts, .slim #side { display: none; }
+    .narrow #body { layout: vertical; }
+    .narrow #procs { height: 1fr; }
+    .narrow #side { width: 1fr; height: 45%; border-left: none; border-top: tall $panel; }
+    .narrow #charts { grid-size: 2 4; height: 16; }
+    .short #charts { display: none; }
     #filter { display: none; height: 3; margin: 0 1; }
     #filter.visible { display: block; }
     HelpScreen { align: center middle; }
@@ -197,6 +209,7 @@ class MemTaskManApp(App):
         self.show_all = False
         self.group_mode = "none"  # none | app | cgroup (Linux)
         self.filter_text = ""
+        self.compact_cols = 0  # column tier, see _column_tier
         self.paused = False
         self.chart_mode = -1  # -1 = all charts, else index into CHARTS
         self.snapshot: Snapshot | None = None
@@ -226,7 +239,30 @@ class MemTaskManApp(App):
         yield Input(placeholder="filter by name, runtime or PID   (Enter keeps it, Esc clears)", id="filter")
         yield Footer()
 
+    def on_resize(self, event) -> None:
+        self._apply_size(event.size.width, event.size.height)
+
+    def _column_tier(self, width: int) -> int:
+        slim = self.screen.has_class("slim")
+        narrow = width < NARROW_W
+        table_w = width if (slim or narrow) else width - SIDE_W
+        if table_w >= FULL_COLS_W:
+            return 0
+        return 1 if table_w >= MID_COLS_W else 2 if table_w >= SMALL_COLS_W else 3
+
+    def _apply_size(self, width: int, height: int) -> None:
+        self.screen.set_class(width < NARROW_W, "narrow")
+        self.screen.set_class(height < SHORT_H, "short")
+        compact = self._column_tier(width)
+        if compact != self.compact_cols:
+            self.compact_cols = compact
+            self._setup_columns()
+            if self.snapshot:
+                self.render_table()
+
     def on_mount(self) -> None:
+        self.compact_cols = self._column_tier(self.size.width)
+        self._apply_size(self.size.width, self.size.height)
         self._setup_columns()
         self.set_interval(self.interval, self.tick)
         self.tick()
@@ -238,15 +274,16 @@ class MemTaskManApp(App):
         last = "Pool" if WINDOWS else "Swap"
         first = "Procs" if self.grouped else "PID"
         t.add_column(first, key="pid", width=7)
-        t.add_column("Name", key="name", width=26)
+        t.add_column("Name", key="name", width=18 if self.compact_cols >= 2 else 26)
         t.add_column("Resident", key="resident", width=9)
-        if UNIQUE:
+        if UNIQUE and self.compact_cols < 3:
             t.add_column(UNIQUE[0], key=UNIQUE[1], width=9)
         t.add_column(pl, key="private", width=9)
         t.add_column("Growth", key="growth", width=10)
-        t.add_column("Faults/s", key="faults", width=8)
-        t.add_column(last, key="extra", width=7)
-        t.add_column("Runtime", key="runtime", width=24)
+        if not self.compact_cols:
+            t.add_column("Faults/s", key="faults", width=8)
+            t.add_column(last, key="extra", width=7)
+        t.add_column("Runtime", key="runtime", width=(24, 18, 14, 14)[self.compact_cols])
 
     def collector_private_label(self) -> str:
         from memtaskman.collector import private_label
@@ -457,17 +494,14 @@ class MemTaskManApp(App):
                 name,
                 Text(fmt_bytes(p.resident), justify="right"),
             ]
-            if UNIQUE:
+            if UNIQUE and self.compact_cols < 3:
                 cells.append(Text(fmt_bytes(getattr(p, UNIQUE[1])), justify="right"))
-            t.add_row(
-                *cells,
-                Text(fmt_bytes(p.private), justify="right"),
-                growth,
-                Text(fmt_count_rate(p.faults_ps), justify="right"),
-                Text(fmt_bytes(extra) if extra is not None else "-", justify="right"),
-                Text(rt, style="magenta" if p.runtime else ""),
-                key=k,
-            )
+            cells += [Text(fmt_bytes(p.private), justify="right"), growth]
+            if not self.compact_cols:
+                cells += [Text(fmt_count_rate(p.faults_ps), justify="right"),
+                          Text(fmt_bytes(extra) if extra is not None else "-", justify="right")]
+            cells.append(Text(rt, style="magenta" if p.runtime else ""))
+            t.add_row(*cells, key=k)
         if self.selected in self.rows:
             t.move_cursor(row=t.get_row_index(self.selected), animate=False, scroll=False)
         t.scroll_to(y=scroll_y, animate=False)
@@ -676,6 +710,7 @@ class MemTaskManApp(App):
 
     def action_mode(self) -> None:
         self.screen.toggle_class("slim")
+        self._apply_size(self.size.width, self.size.height)  # slim frees the side panel's width
 
     def action_pause(self) -> None:
         self.paused = not self.paused
