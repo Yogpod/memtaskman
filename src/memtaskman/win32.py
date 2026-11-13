@@ -1,0 +1,390 @@
+"""Windows memory sources via ctypes (no extra dependencies).
+
+* PDH ``\\Memory\\*`` counters: standby / modified / free lists, pools, fault rates.
+* ``GetPerformanceInfo``: commit charge and limit.
+* ``VirtualQueryEx`` walk: committed bytes per region type (image / mapped / private).
+* ``QueryWorkingSet``: which of those pages are resident right now, and shared or not.
+* ``EnumProcessModulesEx``: loaded DLL names for runtime identification.
+
+Everything degrades to ``None`` when access is denied (elevated or protected
+processes when running unelevated).
+"""
+
+from __future__ import annotations
+
+import bisect
+import ctypes
+import mmap
+import os
+import string
+import sys
+import time
+from ctypes import wintypes as wt
+
+from memtaskman.model import (
+    CAT_HEAP,
+    CAT_IMAGE,
+    CAT_MAPPED,
+    CAT_SHM,
+    CAT_STACK,
+    DERIVED,
+    MEASURED,
+    Category,
+    FileMapping,
+    Inspection,
+)
+
+assert sys.platform == "win32"
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+pdh = ctypes.WinDLL("pdh")
+
+PAGE_SIZE = mmap.PAGESIZE
+
+PROCESS_QUERY_INFORMATION = 0x0400
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_VM_READ = 0x0010
+MEM_COMMIT = 0x1000
+MEM_RESERVE = 0x2000
+MEM_IMAGE = 0x1000000
+MEM_MAPPED = 0x40000
+MEM_PRIVATE = 0x20000
+PAGE_GUARD = 0x100
+ERROR_BAD_LENGTH = 24
+LIST_MODULES_ALL = 0x03
+
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+
+
+class MEMORY_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("BaseAddress", ctypes.c_void_p),
+        ("AllocationBase", ctypes.c_void_p),
+        ("AllocationProtect", wt.DWORD),
+        ("PartitionId", wt.WORD),
+        ("RegionSize", ctypes.c_size_t),
+        ("State", wt.DWORD),
+        ("Protect", wt.DWORD),
+        ("Type", wt.DWORD),
+    ]
+
+
+kernel32.VirtualQueryEx.restype = ctypes.c_size_t
+kernel32.VirtualQueryEx.argtypes = [wt.HANDLE, ctypes.c_void_p, ctypes.POINTER(MEMORY_BASIC_INFORMATION), ctypes.c_size_t]
+kernel32.K32GetMappedFileNameW.restype = wt.DWORD
+kernel32.K32GetMappedFileNameW.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPWSTR, wt.DWORD]
+kernel32.K32QueryWorkingSet.restype = wt.BOOL
+kernel32.K32QueryWorkingSet.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD]
+kernel32.K32EnumProcessModulesEx.restype = wt.BOOL
+kernel32.K32EnumProcessModulesEx.argtypes = [wt.HANDLE, ctypes.POINTER(wt.HMODULE), wt.DWORD, ctypes.POINTER(wt.DWORD), wt.DWORD]
+kernel32.K32GetModuleBaseNameW.restype = wt.DWORD
+kernel32.K32GetModuleBaseNameW.argtypes = [wt.HANDLE, wt.HMODULE, wt.LPWSTR, wt.DWORD]
+kernel32.QueryDosDeviceW.restype = wt.DWORD
+kernel32.QueryDosDeviceW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
+
+
+class PERFORMANCE_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("cb", wt.DWORD),
+        ("CommitTotal", ctypes.c_size_t),
+        ("CommitLimit", ctypes.c_size_t),
+        ("CommitPeak", ctypes.c_size_t),
+        ("PhysicalTotal", ctypes.c_size_t),
+        ("PhysicalAvailable", ctypes.c_size_t),
+        ("SystemCache", ctypes.c_size_t),
+        ("KernelTotal", ctypes.c_size_t),
+        ("KernelPaged", ctypes.c_size_t),
+        ("KernelNonpaged", ctypes.c_size_t),
+        ("PageSize", ctypes.c_size_t),
+        ("HandleCount", wt.DWORD),
+        ("ProcessCount", wt.DWORD),
+        ("ThreadCount", wt.DWORD),
+    ]
+
+
+kernel32.K32GetPerformanceInfo.restype = wt.BOOL
+kernel32.K32GetPerformanceInfo.argtypes = [ctypes.POINTER(PERFORMANCE_INFORMATION), wt.DWORD]
+
+
+def performance_info() -> dict[str, int] | None:
+    pi = PERFORMANCE_INFORMATION()
+    pi.cb = ctypes.sizeof(pi)
+    if not kernel32.K32GetPerformanceInfo(ctypes.byref(pi), pi.cb):
+        return None
+    ps = pi.PageSize
+    return {
+        "commit_total": pi.CommitTotal * ps,
+        "commit_limit": pi.CommitLimit * ps,
+        "commit_peak": pi.CommitPeak * ps,
+        "physical_total": pi.PhysicalTotal * ps,
+        "physical_available": pi.PhysicalAvailable * ps,
+        "system_cache": pi.SystemCache * ps,
+        "kernel_paged": pi.KernelPaged * ps,
+        "kernel_nonpaged": pi.KernelNonpaged * ps,
+    }
+
+
+# --------------------------------------------------------------------------- PDH
+
+
+class _PdhValue(ctypes.Union):
+    _fields_ = [("longValue", ctypes.c_long), ("doubleValue", ctypes.c_double), ("largeValue", ctypes.c_longlong)]
+
+
+class PDH_FMT_COUNTERVALUE(ctypes.Structure):
+    _fields_ = [("CStatus", wt.DWORD), ("u", _PdhValue)]
+
+
+PDH_FMT_DOUBLE = 0x00000200
+PDH_FMT_NOCAP100 = 0x00008000
+pdh.PdhOpenQueryW.restype = ctypes.c_long
+pdh.PdhOpenQueryW.argtypes = [wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
+pdh.PdhAddEnglishCounterW.restype = ctypes.c_long
+pdh.PdhAddEnglishCounterW.argtypes = [wt.HANDLE, wt.LPCWSTR, ctypes.c_size_t, ctypes.POINTER(wt.HANDLE)]
+pdh.PdhCollectQueryData.restype = ctypes.c_long
+pdh.PdhCollectQueryData.argtypes = [wt.HANDLE]
+pdh.PdhGetFormattedCounterValue.restype = ctypes.c_long
+pdh.PdhGetFormattedCounterValue.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.POINTER(PDH_FMT_COUNTERVALUE)]
+pdh.PdhCloseQuery.argtypes = [wt.HANDLE]
+
+MEMORY_COUNTERS = {
+    "standby_core": r"\Memory\Standby Cache Core Bytes",
+    "standby_normal": r"\Memory\Standby Cache Normal Priority Bytes",
+    "standby_reserve": r"\Memory\Standby Cache Reserve Bytes",
+    "modified": r"\Memory\Modified Page List Bytes",
+    "free_zero": r"\Memory\Free & Zero Page List Bytes",
+    "cache": r"\Memory\Cache Bytes",
+    "pool_paged": r"\Memory\Pool Paged Bytes",
+    "pool_nonpaged": r"\Memory\Pool Nonpaged Bytes",
+    "driver_resident": r"\Memory\System Driver Resident Bytes",
+    "code_resident": r"\Memory\System Code Resident Bytes",
+    "page_faults_ps": r"\Memory\Page Faults/sec",
+    "pages_input_ps": r"\Memory\Pages Input/sec",
+    "pages_output_ps": r"\Memory\Pages Output/sec",
+    "pagefile_pct": r"\Paging File(_Total)\% Usage",
+}
+
+
+class PdhQuery:
+    """A small wrapper that keeps one PDH query open across samples."""
+
+    def __init__(self, counters: dict[str, str] = MEMORY_COUNTERS):
+        self.handle = wt.HANDLE()
+        self.counters: dict[str, wt.HANDLE] = {}
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.handle)) != 0:
+            self.handle = None
+            return
+        for key, path in counters.items():
+            h = wt.HANDLE()
+            if pdh.PdhAddEnglishCounterW(self.handle, path, 0, ctypes.byref(h)) == 0:
+                self.counters[key] = h
+        pdh.PdhCollectQueryData(self.handle)  # prime rate counters
+
+    def sample(self) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if not self.handle or pdh.PdhCollectQueryData(self.handle) != 0:
+            return out
+        val = PDH_FMT_COUNTERVALUE()
+        for key, h in self.counters.items():
+            if pdh.PdhGetFormattedCounterValue(h, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, None, ctypes.byref(val)) == 0:
+                out[key] = val.u.doubleValue
+        return out
+
+    def close(self) -> None:
+        if self.handle:
+            pdh.PdhCloseQuery(self.handle)
+            self.handle = None
+
+
+# --------------------------------------------------------------------------- processes
+
+
+def _open(pid: int, access: int) -> int | None:
+    h = kernel32.OpenProcess(access, False, pid)
+    return h or None
+
+
+def module_names(pid: int) -> list[str] | None:
+    """Basenames of loaded modules, or None when the process cannot be opened."""
+    h = _open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+    if not h:
+        return None
+    try:
+        count = 512
+        while True:
+            arr = (wt.HMODULE * count)()
+            needed = wt.DWORD()
+            if not kernel32.K32EnumProcessModulesEx(h, arr, ctypes.sizeof(arr), ctypes.byref(needed), LIST_MODULES_ALL):
+                return None
+            n = needed.value // ctypes.sizeof(wt.HMODULE)
+            if n <= count:
+                break
+            count = n + 64
+        buf = ctypes.create_unicode_buffer(260)
+        names = []
+        for i in range(n):
+            if kernel32.K32GetModuleBaseNameW(h, arr[i], buf, 260):
+                names.append(buf.value)
+        return names
+    finally:
+        kernel32.CloseHandle(h)
+
+
+_device_map: list[tuple[str, str]] | None = None
+
+
+def _dos_devices() -> list[tuple[str, str]]:
+    global _device_map
+    if _device_map is None:
+        m = []
+        buf = ctypes.create_unicode_buffer(1024)
+        for letter in string.ascii_uppercase:
+            if kernel32.QueryDosDeviceW(f"{letter}:", buf, 1024):
+                m.append((buf.value + "\\", f"{letter}:\\"))
+        _device_map = m
+    return _device_map
+
+
+def device_to_dos(path: str) -> str:
+    for dev, drive in _dos_devices():
+        if path.startswith(dev):
+            return drive + path[len(dev):]
+    return path
+
+
+def _walk_regions(h) -> list[tuple[int, int, int, int, int, int]]:
+    """(base, size, state, type, protect, allocation_base) for every region."""
+    regions = []
+    mbi = MEMORY_BASIC_INFORMATION()
+    addr = 0
+    sz = ctypes.sizeof(mbi)
+    limit = 1 << 47 if ctypes.sizeof(ctypes.c_void_p) == 8 else 1 << 31
+    while addr < limit:
+        if not kernel32.VirtualQueryEx(h, ctypes.c_void_p(addr), ctypes.byref(mbi), sz):
+            break
+        base = mbi.BaseAddress or 0
+        size = mbi.RegionSize
+        regions.append((base, size, mbi.State, mbi.Type, mbi.Protect, mbi.AllocationBase or 0))
+        nxt = base + size
+        if nxt <= addr:
+            break
+        addr = nxt
+    return regions
+
+
+def _working_set(h) -> list[int] | None:
+    """Raw PSAPI_WORKING_SET_BLOCK values, or None on failure."""
+    ptr = ctypes.sizeof(ctypes.c_size_t)
+    count = 4096
+    for _ in range(6):
+        buf = (ctypes.c_size_t * (count + 1))()
+        if kernel32.K32QueryWorkingSet(h, buf, ctypes.sizeof(buf)):
+            n = buf[0]
+            return list(buf[1 : 1 + n])
+        if ctypes.get_last_error() != ERROR_BAD_LENGTH:
+            return None
+        count = int(buf[0] * 1.25) + 4096
+    return None
+
+
+def inspect(pid: int, name: str, *, top_files: int = 12) -> Inspection:
+    t0 = time.perf_counter()
+    ins = Inspection(pid=pid, name=name)
+    h = _open(pid, PROCESS_QUERY_INFORMATION | PROCESS_VM_READ)
+    if not h:
+        ins.error = "access denied (run elevated to inspect this process)"
+        return ins
+    try:
+        regions = _walk_regions(h)
+        name_buf = ctypes.create_unicode_buffer(1024)
+        file_of_alloc: dict[int, str | None] = {}
+
+        cats = {c: Category(c) for c in (CAT_HEAP, CAT_STACK, CAT_IMAGE, CAT_MAPPED, CAT_SHM)}
+        files: dict[str, FileMapping] = {}
+        reserved = 0
+        # Committed regions only, in address order, for page attribution.
+        starts: list[int] = []
+        spans: list[tuple[int, str, str | None]] = []  # (end, category, file path)
+
+        # Thread stacks: a private allocation that contains a PAGE_GUARD region.
+        stack_allocs = {ab for (_b, _s, st, ty, pr, ab) in regions if st == MEM_COMMIT and ty == MEM_PRIVATE and pr & PAGE_GUARD}
+
+        for base, size, state, typ, _prot, alloc in regions:
+            if state == MEM_RESERVE:
+                reserved += size
+                continue
+            if state != MEM_COMMIT:
+                continue
+            path = None
+            if typ == MEM_PRIVATE:
+                cat = CAT_STACK if alloc in stack_allocs else CAT_HEAP
+            else:
+                if alloc not in file_of_alloc:
+                    n = kernel32.K32GetMappedFileNameW(h, ctypes.c_void_p(base), name_buf, 1024)
+                    file_of_alloc[alloc] = device_to_dos(name_buf.value) if n else None
+                path = file_of_alloc[alloc]
+                if typ == MEM_IMAGE:
+                    cat = CAT_IMAGE
+                elif path:
+                    cat = CAT_MAPPED
+                else:
+                    cat = CAT_SHM  # pagefile-backed section: shared memory
+            c = cats[cat]
+            c.mapped += size
+            c.regions += 1
+            if path:
+                fm = files.get(path)
+                if fm is None:
+                    fm = files[path] = FileMapping(path, "image" if typ == MEM_IMAGE else "mapped")
+                fm.mapped += size
+            starts.append(base)
+            spans.append((base + size, cat, path))
+
+        ins.reserved = reserved
+        ins.evidence.append((MEASURED, f"{len(regions)} regions walked with VirtualQueryEx"))
+
+        ws = _working_set(h)
+        if ws is not None:
+            for c in cats.values():
+                c.resident = 0
+                c.resident_shared = 0
+            for fm in files.values():
+                fm.resident = 0
+            unattributed = 0
+            for entry in ws:
+                va = (entry >> 12) << 12
+                i = bisect.bisect_right(starts, va) - 1
+                if i < 0 or va >= spans[i][0]:
+                    unattributed += 1
+                    continue
+                _end, cat, path = spans[i]
+                c = cats[cat]
+                c.resident += PAGE_SIZE
+                if entry & 0x100:
+                    c.resident_shared += PAGE_SIZE
+                if path:
+                    files[path].resident += PAGE_SIZE
+            ins.evidence.append((DERIVED, f"{len(ws):,} resident pages attributed via QueryWorkingSet"))
+            if unattributed:
+                ins.evidence.append((DERIVED, f"{unattributed:,} resident pages are page tables / outside user regions"))
+        else:
+            ins.evidence.append((MEASURED, "working set detail unavailable; showing committed sizes only"))
+
+        ins.categories = [c for c in cats.values() if c.mapped]
+        key = (lambda f: f.resident or 0) if ws is not None else (lambda f: f.mapped)
+        ins.top_files = sorted(files.values(), key=key, reverse=True)[:top_files]
+        for f in ins.top_files:
+            f.path = _short_path(f.path)
+    finally:
+        kernel32.CloseHandle(h)
+    ins.elapsed = time.perf_counter() - t0
+    return ins
+
+
+def _short_path(p: str) -> str:
+    win = os.environ.get("SystemRoot", r"C:\Windows")
+    if p.lower().startswith(win.lower()):
+        return "%SystemRoot%" + p[len(win):]
+    return p
