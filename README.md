@@ -148,12 +148,16 @@ mtm --no-host               don't read the WSL2 guest's memory when inspecting v
 mtm inspect PID [--json]    address-space breakdown of one process
 mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all]   append snapshots (JSON Lines)
 mtm summary out.jsonl [--top N] [--json]   steadily growing processes in a recording (leak finder)
-mtm diff a.json b.json      what grew, appeared or went away between snapshots
+mtm diff a.json b.json [--json] [--threshold 16m] [--by-name]   what grew, restarted, appeared or went away
 ```
 
 Recording size: about 19 KB per snapshot with the default `--top 50` (~14 MB/hour at the default
 5 s interval) and about 120 KB with `--all` (~85 MB/hour). An interrupted recording can be
 appended to; a half-written last line is skipped when reading.
+
+`diff` pairs processes by PID *and* start time (a reused PID is a different process), pairs
+a unique name that came back under a new PID as `restarted`, and hides changes under 16 MiB
+in text output (`--json` keeps everything).
 
 Tip: take both snapshots with `--all` before using `diff`, otherwise processes outside the
 top N look like they appeared or vanished.

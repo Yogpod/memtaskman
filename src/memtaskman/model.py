@@ -88,6 +88,7 @@ class Snapshot:
     processes: list[ProcessMem]
     private_label: str = "Private"  # what "private" means on this platform
     cgroups: list[ProcessMem] | None = None  # Linux: one row per cgroup, from kernel accounting
+    truncated: bool = False  # processes were limited to the top N (diff reports "not listed")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +96,7 @@ class Snapshot:
             "time": self.time,
             "platform": self.platform,
             "private_label": self.private_label,
+            "truncated": self.truncated,
             "system": self.system.to_dict() if self.system else None,
             "processes": [p.to_dict() for p in self.processes],
             "cgroups": [g.to_dict() for g in self.cgroups] if self.cgroups is not None else None,

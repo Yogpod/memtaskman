@@ -35,6 +35,7 @@ def cmd_main(args) -> int:
 
             snap.processes = [p for p in snap.processes if matches(p, args.filter)]
         if not args.all:
+            snap.truncated = len(snap.processes) > args.top
             snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
         print(report.to_json(snap) if args.json else report.render_text(snap, top=None))
         return 0
@@ -67,12 +68,25 @@ def cmd_inspect(args) -> int:
 
 
 def cmd_diff(args) -> int:
-    from memtaskman.diff import diff_snapshots
+    from memtaskman.diff import by_name, diff_data, render
 
     with open(args.a, encoding="utf-8") as fa, open(args.b, encoding="utf-8") as fb:
         a, b = json.load(fa), json.load(fb)
-    print(diff_snapshots(a, b, top=args.top))
+    if args.by_name:
+        print(by_name(a, b, top=args.top))
+        return 0
+    d = diff_data(a, b, threshold=args.threshold)
+    print(json.dumps(d, indent=2) if args.json else render(d, top=args.top))
     return 0
+
+
+def _size_arg(text: str) -> int:
+    from memtaskman.fmt import parse_size
+
+    v = parse_size(text)
+    if v is None:
+        raise argparse.ArgumentTypeError(f"bad size: {text!r} (use e.g. 0, 512k, 16m, 1g)")
+    return v
 
 
 def cmd_record(args) -> int:
@@ -92,6 +106,7 @@ def cmd_record(args) -> int:
 
                     snap.processes = [p for p in snap.processes if matches(p, args.filter)]
                 if not args.all:
+                    snap.truncated = len(snap.processes) > args.top
                     snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
                 f.write(json.dumps(snap.to_dict(), separators=(",", ":")) + "\n")
                 f.flush()
@@ -178,6 +193,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("a")
     d.add_argument("b")
     d.add_argument("--top", type=int, default=20)
+    d.add_argument("--json", action="store_true", help="machine-readable output with every change")
+    d.add_argument("--threshold", type=_size_arg, default=16 * 1024 * 1024,
+                   help="hide changes smaller than this in text output (default 16m)")
+    d.add_argument("--by-name", action="store_true", help="totals per executable name instead of per process")
     d.set_defaults(func=cmd_diff)
 
     r = sub.add_parser("record", help="append snapshots to a JSON Lines file")
