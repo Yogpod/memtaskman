@@ -157,11 +157,19 @@ async def small_terminal_checks() -> None:
     app = MemTaskManApp(interval=0.5)
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause(2.5)
-        side = app.query_one("#side")
-        table = app.query_one("#procs")
-        check(app.screen.has_class("narrow") and side.region.y < 24 and side.region.height > 2,
-              f"80x24: side panel below the table at row {side.region.y}")
+        device, table, insp = app.query_one("#device"), app.query_one("#procs"), app.query_one("#inspector")
+        stacked = device.region.y < table.region.y < insp.region.y < 24
+        check(stacked and table.region.height >= 4, f"80x24: memory / table ({table.region.height} rows) / inspector stacked")
+        check(not app.query_one("#system").display, "80x24: system and chart boxes hidden on a short terminal")
         check(table.region.width <= 80 and app.compact_cols == 3, f"80x24: compact columns (tier {app.compact_cols})")
+    app = MemTaskManApp(interval=0.5)
+    async with app.run_test(size=(180, 60)) as pilot:
+        await pilot.pause(2.5)
+        order = [app.query_one(sel).region.y for sel in ("#device", "#system", "#history", "#procs", "#inspector")]
+        check(order == sorted(order) and len(set(order)) == 5, "180x60: memory, system, charts, table, inspector in order")
+        await pilot.press("c")
+        await pilot.pause(0.5)
+        check(app.chart_mode == 0 and app.query_one("#chart-mode").value == 0, "c cycles the chart dropdown")
 
 
 def run(*args: str) -> subprocess.CompletedProcess:
