@@ -162,10 +162,10 @@ class MemTaskManApp(App):
         Binding("question_mark", "help", "Help", key_display="?"),
     ]
 
-    def __init__(self, interval: float = 1.0, system: bool = True):
+    def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True):
         super().__init__()
         self.interval = max(0.25, interval)
-        self.collector = Collector(system=system)
+        self.collector = Collector(system=system, wsl_guest=wsl_guest)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
         self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
@@ -342,6 +342,7 @@ class MemTaskManApp(App):
         if not sm:
             w.update("[dim]system counters disabled[/dim]")
             return
+        note = Text(sm.vm_note, style="yellow") if sm.vm_note else None
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim")
         t.add_column(justify="right")
@@ -358,7 +359,7 @@ class MemTaskManApp(App):
         for label, value, note in rows:
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
-        w.update(Group(Text("System", style="bold"), t))
+        w.update(Group(Text("System", style="bold"), t, *([note] if note else [])))
 
     def _ordered(self, snap: Snapshot) -> list[ProcessMem]:
         if self.group_mode == "cgroup" and snap.cgroups is not None:
@@ -538,6 +539,24 @@ class MemTaskManApp(App):
         parts.append(head)
         if ins.error:
             parts.append(Text(ins.error, style="red"))
+        if ins.guest:
+            g = ins.guest
+            parts.append(Text(f"\nInside the WSL2 VM ({g['distro']})", style="bold"))
+            gt = Table(box=None, padding=(0, 1), show_edge=False, show_header=False)
+            gt.add_column(style="dim")
+            gt.add_column(justify="right")
+            gt.add_column()
+            total = g.get("total") or 1
+            for label, key, color in (("Used by Linux", "used", C_USED), ("  anonymous", "anon", C_USED),
+                                      ("Page cache", "cache", C_STANDBY), ("  of which tmpfs", "shmem", C_MOD),
+                                      ("Free", "free", C_FREE), ("VM size", "total", "")):
+                v = g.get(key)
+                if v is not None:
+                    bar = Text("█" * round(16 * v / total), style=color) if color else Text("")
+                    gt.add_row(label, fmt_bytes(v), bar)
+            parts.append(gt)
+            parts.append(Text("read on demand while this row is selected; WSL is never started",
+                              style="dim"))
         if ins.categories:
             total_res = sum(c.resident or 0 for c in ins.categories) or 1
             t = Table(box=None, padding=(0, 1), show_edge=False, header_style="bold dim")
@@ -569,7 +588,7 @@ class MemTaskManApp(App):
             parts.append(Text("\nEvidence", style="bold"))
             for level, text in ins.evidence:
                 line = Text()
-                line.append(f"{level:<10}", style=LEVEL_STYLE.get(level, ""))
+                line.append(f"{level:<11}", style=LEVEL_STYLE.get(level, ""))
                 line.append(text)
                 parts.append(line)
         if ins.cmdline:

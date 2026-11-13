@@ -15,6 +15,7 @@ from memtaskman import runtime as rt
 from memtaskman.model import (
     CATEGORY_ORDER,
     DERIVED,
+    MEASURED,
     HINT,
     Inspection,
     ProcessMem,
@@ -77,8 +78,9 @@ class _RuntimeEntry:
 
 
 class Collector:
-    def __init__(self, system: bool = True):
+    def __init__(self, system: bool = True, wsl_guest: bool = True):
         self.want_system = system
+        self.wsl_guest = wsl_guest and WINDOWS
         self._pdh = native.PdhQuery() if WINDOWS and system else None
         self._pws = native.PrivateWorkingSet() if WINDOWS else None
         self._tracks: dict[tuple[int, float], _Track] = {}
@@ -258,6 +260,8 @@ class Collector:
 
     def _system_linux(self, sm: SystemMemory, now: float) -> None:
         sm.source = "/proc/meminfo + /proc/vmstat"
+        if native.is_wsl():
+            sm.vm_note = native.WSL_NOTE
         mi = native.meminfo()
         sm.free = mi.get("MemFree")
         sm.cached = mi.get("Cached", 0) + mi.get("Buffers", 0) if "Cached" in mi else None
@@ -424,6 +428,8 @@ class Collector:
                 ins = native.inspect(p.pid, p.name)
             except Exception as e:  # noqa: BLE001 - a racing process exit can surface many error types
                 ins = Inspection(p.pid, p.name, error=f"{type(e).__name__}: {e}")
+        if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
+            self._add_wsl_guest(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
@@ -438,6 +444,39 @@ class Collector:
         elif not ins.error:
             ins.evidence.insert(0, (HINT, "no known runtime recognised"))
         return ins
+
+    def _add_wsl_guest(self, ins: Inspection, p: ProcessMem) -> None:
+        from memtaskman import wslhost
+        from memtaskman.fmt import fmt_bytes
+
+        guest, why = wslhost.guest_memory()
+        if guest is None:
+            ins.evidence.append((HINT, f"guest view unavailable: {why}"))
+            return
+        ins.guest = guest
+        if ins.error and "access denied" in ins.error:
+            ins.error = None  # expected for the VM process; the guest view below is what matters
+            ins.evidence.append((MEASURED, "VM process address space is not inspectable; showing the guest's view"))
+        used, cache = guest.get("used"), guest.get("reclaimable_cache")
+        ins.evidence.append((MEASURED, f"guest {guest['distro']}: {fmt_bytes(used)} used, "
+                                       f"{fmt_bytes(guest.get('cache'))} page cache, {fmt_bytes(guest.get('free'))} free "
+                                       f"(of {fmt_bytes(guest.get('total'))})"))
+        if used is not None and p.resident > used:
+            ins.evidence.append((DERIVED, f"Windows holds {fmt_bytes(p.resident)} for the VM but the guest only uses "
+                                          f"{fmt_bytes(used)}: the other {fmt_bytes(p.resident - used)} is guest cache / "
+                                          f"freed pages not yet returned"))
+        cfg = wslhost.read_wslconfig()
+        limit = cfg.get("wsl2.memory")
+        ins.evidence.append((HINT, f".wslconfig memory={limit} caps the VM" if limit else
+                             "no memory= limit in .wslconfig: the VM may grow to half of RAM by default"))
+        reclaim = cfg.get("experimental.automemoryreclaim") or cfg.get("wsl2.automemoryreclaim")
+        if reclaim:
+            ins.evidence.append((HINT, f"autoMemoryReclaim={reclaim} is set"))
+        else:
+            ins.evidence.append((HINT, "autoMemoryReclaim=gradual in .wslconfig returns idle cache to Windows"))
+        if cache:
+            ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
+                                       "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
 
     def close(self) -> None:
         if self._pdh:

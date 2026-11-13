@@ -331,5 +331,17 @@ def inspect(pid: int, name: str, *, top_files: int = 12) -> Inspection:
     return ins
 
 
+def is_wsl() -> bool:
+    if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop") or os.path.exists("/run/WSL"):
+        return True
+    rel = (_read("/proc/sys/kernel/osrelease") or "").lower()
+    return "microsoft" in rel and "wsl" in rel
+
+
+WSL_NOTE = ("WSL2 VM: this RAM is the Windows process vmmemWSL. Page cache here still holds host RAM "
+            "until reclaimed. Cap it with [wsl2] memory= in %UserProfile%\\.wslconfig; "
+            "autoMemoryReclaim returns cache to Windows")
+
+
 def is_linux() -> bool:
     return os.path.exists("/proc/meminfo")

@@ -34,6 +34,11 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
 - **Leak watch**: rows marked **▲** have private bytes that rose in a straight line (least-squares
   R² ≥ 0.85, at least 16 MiB and 5%) over at least 2 of the last 10 minutes. Garbage-collector
   sawtooth patterns aren't flagged. For hours-long hunts, `mtm record` then `mtm summary`.
+- **What's inside `vmmemWSL`** (Windows): select the `vmmemWSL` row (or `mtm inspect <pid>`) to see
+  the WSL2 guest's own view: used, page cache, tmpfs and free, versus what Windows holds for
+  the VM, plus `.wslconfig` limit and reclaim hints. It's read on demand and only when a distro
+  is already running, because polling would keep WSL from shutting down when idle. Disable it
+  with `--no-host`. Inside WSL, the Linux view notes that its RAM is really `vmmemWSL` on the host.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
 - **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
@@ -108,6 +113,7 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
 mtm inspect PID [--json]    address-space breakdown of one process
 mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all]   append snapshots (JSON Lines)
 mtm summary out.jsonl [--top N] [--json]   steadily growing processes in a recording (leak finder)

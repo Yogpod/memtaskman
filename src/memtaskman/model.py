@@ -38,6 +38,7 @@ class SystemMemory:
     pressure_some: float | None = None  # Linux PSI: % of time some task stalled on memory (avg10)
     pressure_full: float | None = None  # Linux PSI: % of time all tasks stalled on memory (avg10)
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
+    vm_note: str | None = None  # e.g. "this is a WSL2 VM" when running inside one
     source: str = "psutil"
 
     def to_dict(self) -> dict[str, Any]:
@@ -126,6 +127,7 @@ class Inspection:
     reserved: int | None = None  # address space reserved but not committed (Win)
     evidence: list[tuple[str, str]] = field(default_factory=list)  # (level, text)
     cmdline: list[str] = field(default_factory=list)
+    guest: dict | None = None  # vmmemWSL: the WSL2 guest's own memory view (wslhost.guest_memory)
     error: str | None = None
     elapsed: float = 0.0
 

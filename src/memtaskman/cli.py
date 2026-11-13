@@ -36,7 +36,7 @@ def cmd_main(args) -> int:
         return 0
     from memtaskman.app import MemTaskManApp
 
-    MemTaskManApp(interval=args.interval, system=not args.no_system).run()
+    MemTaskManApp(interval=args.interval, system=not args.no_system, wsl_guest=not args.no_host).run()
     return 0
 
 
@@ -46,7 +46,7 @@ def cmd_inspect(args) -> int:
     from memtaskman import report
     from memtaskman.collector import Collector
 
-    c = Collector(system=False)
+    c = Collector(system=False, wsl_guest=not args.no_host)
     snap = c.sample()
     p = next((p for p in snap.processes if p.pid == args.pid), None)
     if p is None:
@@ -152,11 +152,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--no-host", action="store_true",
+                   help="Windows: don't read the WSL2 guest's memory when inspecting vmmemWSL")
     sub = p.add_subparsers(dest="cmd")
 
     ins = sub.add_parser("inspect", help="break down one process's address space")
     ins.add_argument("pid", type=int)
     ins.add_argument("--json", action="store_true")
+    ins.add_argument("--no-host", action="store_true", help="don't read the WSL2 guest's memory for vmmemWSL")
     ins.set_defaults(func=cmd_inspect)
 
     d = sub.add_parser("diff", help="compare two --json snapshots")
