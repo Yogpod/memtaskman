@@ -16,6 +16,28 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
 > macOS support (footprint, compression, memory pressure, and a vmmap-style inspector) is new and
 > **not yet validated on a real Mac**; it's checked by CI on Apple silicon runners.
 
+![memtaskman dashboard: RAM, commit and swap bars, eight history charts, the process table and the inspector breaking a Steam web helper process into heap, stacks, DLLs and mapped files](docs/screenshots/dashboard.svg)
+
+<details>
+<summary>More screenshots: grouped by app, slim mode, help</summary>
+
+**Grouped by app** (`g`): every process of the same executable summed into one row.
+
+![Processes grouped by executable, with process counts](docs/screenshots/grouped.svg)
+
+**Slim mode** (`m`): just the bars and the table.
+
+![Slim mode showing only the memory bars and process table](docs/screenshots/slim.svg)
+
+**Help** (`?`): what every counter means.
+
+![Help screen explaining each counter](docs/screenshots/help.svg)
+
+</details>
+
+Screenshots are captured with `tools/capture_screenshots.py` in privacy mode: no command lines, and
+home directories are shown as `~`.
+
 ## What you get
 
 - **System bar**: RAM split into *In use / Modified / Standby / Free* (Windows) or
