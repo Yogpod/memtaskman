@@ -176,6 +176,47 @@ def low_memory() -> bool | None:
     return bool(state.value)
 
 
+kernel32.GetProcessInformation.restype = wt.BOOL
+kernel32.GetProcessInformation.argtypes = [wt.HANDLE, ctypes.c_int, ctypes.c_void_p, wt.DWORD]
+kernel32.IsProcessInJob.restype = wt.BOOL
+kernel32.IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
+kernel32.GetPriorityClass.restype = wt.DWORD
+kernel32.GetPriorityClass.argtypes = [wt.HANDLE]
+ProcessMemoryPriority, ProcessPowerThrottling = 0, 4
+MEMORY_PRIORITIES = {1: "very low", 2: "low", 3: "medium", 4: "below normal", 5: "normal"}
+IDLE_PRIORITY_CLASS = 0x40
+
+
+class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+    _fields_ = [("Version", wt.ULONG), ("ControlMask", wt.ULONG), ("StateMask", wt.ULONG)]
+
+
+def process_policy(pid: int) -> dict | None:
+    """Memory priority, Efficiency Mode (EcoQoS) and job membership. None if the process can't be opened."""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        out: dict = {}
+        prio = wt.ULONG()
+        if kernel32.GetProcessInformation(h, ProcessMemoryPriority, ctypes.byref(prio), ctypes.sizeof(prio)):
+            out["memory_priority"] = prio.value
+        st = PROCESS_POWER_THROTTLING_STATE(Version=1)
+        if kernel32.GetProcessInformation(h, ProcessPowerThrottling, ctypes.byref(st), ctypes.sizeof(st)):
+            # Execution-speed throttling explicitly on = EcoQoS; Task Manager's Efficiency mode
+            # also drops the priority class to Idle.
+            out["ecoqos"] = bool(st.ControlMask & 1 and st.StateMask & 1)
+        pc = kernel32.GetPriorityClass(h)
+        if pc:
+            out["idle_priority"] = pc == IDLE_PRIORITY_CLASS
+        in_job = wt.BOOL()
+        if kernel32.IsProcessInJob(h, None, ctypes.byref(in_job)):
+            out["in_job"] = bool(in_job.value)
+        return out
+    finally:
+        kernel32.CloseHandle(h)
+
+
 def performance_info() -> dict[str, int] | None:
     pi = PERFORMANCE_INFORMATION()
     pi.cb = ctypes.sizeof(pi)

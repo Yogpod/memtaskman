@@ -529,6 +529,8 @@ class Collector:
         if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
             self._add_wsl_guest(ins, p)
         self._add_models(ins, p)
+        if WINDOWS:
+            self._add_policy(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
@@ -577,6 +579,21 @@ class Collector:
         if cache:
             ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
                                        "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
+
+    def _add_policy(self, ins: Inspection, p: ProcessMem) -> None:
+        pol = native.process_policy(p.pid)
+        if not pol:
+            return
+        mp = pol.get("memory_priority")
+        if mp is not None:
+            note = "" if mp == 5 else ": its pages go to lower-priority standby and are reused sooner"
+            ins.evidence.append((MEASURED, f"memory priority {mp} ({native.MEMORY_PRIORITIES.get(mp, '?')}){note}"))
+        if pol.get("ecoqos"):
+            mode = "Efficiency mode" if pol.get("idle_priority") else "EcoQoS"
+            ins.evidence.append((MEASURED, f"{mode} on: throttled for power efficiency"))
+        if pol.get("in_job"):
+            ins.evidence.append((MEASURED, "runs inside a job object (its memory limits, if any, are only "
+                                           "readable by the job's owner)"))
 
     def _add_models(self, ins: Inspection, p: ProcessMem) -> None:
         """Name memory-mapped model files and, for Ollama, report its RAM / VRAM split."""
