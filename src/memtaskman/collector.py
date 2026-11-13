@@ -98,6 +98,10 @@ class Collector:
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
         self._cg_tracks: dict[str, _Track] = {}
+        self._oom_start: int | None = None
+        self._shm_at = 0.0
+        self._shm_cache: dict | None = None
+        self._last_pids: list[int] = []
         self._pool_hist: deque = deque(maxlen=7)  # (time, {tag: total}) every ~10 s: ~1 minute window
         self._pss_why: dict[tuple[int, float], str] = {}
         self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
@@ -242,6 +246,7 @@ class Collector:
 
     # ------------------------------------------------------------------ system
     def _system(self, now: float, procs: list[ProcessMem]) -> SystemMemory:
+        self._last_pids = [p.pid for p in sorted(procs, key=lambda p: -p.resident)]  # shm holder scan order
         vm = psutil.virtual_memory()
         sm = SystemMemory(total=vm.total, available=vm.available, used=vm.total - vm.available)
         try:
@@ -277,7 +282,9 @@ class Collector:
             if sm.pressure_some is None:
                 why["pressure_some"] = "kernel without PSI (CONFIG_PSI off or psi=0 boot option)"
             if sm.compressed is None:
-                why["compressed"] = "zswap not enabled"
+                why["compressed"] = "neither zswap nor zram is enabled"
+            if sm.slab_top is None:
+                why["slab_top"] = "per-cache slab sizes need root (/proc/slabinfo)"
             if not sm.swap_total:
                 why["swap_total"] = "no swap configured"
         elif MACOS:
@@ -382,6 +389,15 @@ class Collector:
                 sm.hard_faults_ps = (v["pageins"] - prev["pageins"]) / dt
         self._vm_prev = (now, v)
 
+    def _shared_memory(self) -> dict:
+        """RAM held by tmpfs, SysV segments and shared files: memory no single process owns."""
+        holders = native.shared_memory_holders(self._last_pids)
+        sizes = native.shm_file_sizes(list(holders))
+        files = sorted(({"path": p, "size": sizes.get(p), "holders": sorted(h)} for p, h in holders.items()),
+                       key=lambda f: -(f["size"] or 0))
+        sysv = native.sysv_shm()
+        return {"tmpfs": [t for t in native.tmpfs_usage() if t["used"]], "sysv": sysv, "files": files[:20]}
+
     def _system_linux(self, sm: SystemMemory, now: float) -> None:
         sm.source = "/proc/meminfo + /proc/vmstat"
         if native.is_wsl():
@@ -390,6 +406,22 @@ class Collector:
         sm.free = mi.get("MemFree")
         sm.cached = mi.get("Cached", 0) + mi.get("Buffers", 0) if "Cached" in mi else None
         sm.compressed = mi.get("Zswap")
+        page = native.page_size()
+        zr = native.zram()
+        if zr:
+            sm.compressed = (sm.compressed or 0) + zr["used"]
+            sm.extra["zram (original data)"] = zr["original"]
+            sm.extra["zram (RAM used)"] = zr["used"]
+        ks = native.ksm(page)
+        if ks and ks["saved"]:
+            sm.extra["KSM merged (saved)"] = ks["saved"]
+        if mi.get("HugePages_Total"):
+            sm.extra["Hugetlb pages (reserved)"] = mi.get("Hugetlb") or mi["HugePages_Total"] * mi.get("Hugepagesize", 0)
+        sm.slab_top = [{"cache": n, "bytes": b, "objects": o} for n, b, o in native.slab_top(page) or []] or None
+        if now - self._shm_at >= 10 or self._shm_cache is None:
+            self._shm_at = now
+            self._shm_cache = self._shared_memory()
+        sm.shared = self._shm_cache
         sm.commit_used = mi.get("Committed_AS")
         sm.commit_limit = mi.get("CommitLimit")
         sm.kernel_paged = mi.get("SReclaimable")
@@ -412,6 +444,11 @@ class Collector:
                 sm.page_faults_ps = (vs["pgfault"] - prev["pgfault"]) / dt
                 sm.hard_faults_ps = (vs.get("pgmajfault", 0) - prev.get("pgmajfault", 0)) / dt
         self._vm_prev = (now, vs)
+        if "oom_kill" in vs:
+            sm.oom_kills = vs["oom_kill"]
+            if self._oom_start is None:
+                self._oom_start = vs["oom_kill"]
+            sm.oom_kills_new = vs["oom_kill"] - self._oom_start
 
     def _update_leaks(self, now: float) -> None:
         if now - self._leaks_at < LEAK_EVERY:

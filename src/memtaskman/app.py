@@ -488,6 +488,8 @@ class MemTaskManApp(App):
             full = sm0.pressure_full or 0.0
             style = "bold red" if full >= 5 else "yellow" if sm0.pressure_some >= 5 else "dim"
             status.append(f"  pressure some {sm0.pressure_some:.1f}% full {full:.1f}%", style=style)
+        if sm0 and sm0.oom_kills_new:
+            status.append(f"  {sm0.oom_kills_new} OOM kill(s) since start", style="bold red")
         if sm0 and sm0.low_memory:
             status.append("  LOW MEMORY", style="bold red")
         if sm0 and sm0.commit_used and sm0.commit_limit and sm0.commit_used >= 0.9 * sm0.commit_limit:
@@ -575,6 +577,23 @@ class MemTaskManApp(App):
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
         extra = []
+        if sm.slab_top:
+            extra.append(Text("Kernel slab caches", style="bold dim"))
+            for r in sm.slab_top[:6]:
+                extra.append(Text(f"  {r['cache'][:22]:<22} {fmt_bytes(r['bytes']):>8}", style="dim"))
+        sh = sm.shared or {}
+        if sh.get("tmpfs") or sh.get("sysv") or sh.get("files"):
+            extra.append(Text("RAM held outside processes", style="bold dim"))
+            for mnt in sh.get("tmpfs", [])[:4]:
+                extra.append(Text(f"  tmpfs {mnt['mount'][:20]:<20} {fmt_bytes(mnt['used']):>8}", style="dim"))
+            if sh.get("sysv"):
+                rss = sum(s["rss"] for s in sh["sysv"])
+                extra.append(Text(f"  SysV shm  {len(sh['sysv'])} segment(s), {fmt_bytes(rss)} resident", style="dim"))
+            names = {p.pid: p.name for p in self.snapshot.processes} if self.snapshot else {}
+            for f in sh.get("files", [])[:4]:
+                who = ", ".join(sorted({names.get(h, str(h)) for h in f["holders"]}))[:30]
+                size = fmt_bytes(f["size"]) if f["size"] is not None else "?"
+                extra.append(Text(f"  {f['path'][:26]:<26} {size:>7}  {who}", style="dim"))
         if sm.pool_tags:
             extra.append(Text("Kernel pool by tag (nonpaged / paged, growth per min)", style="bold dim"))
             for r in sm.pool_tags[:6] + [r for r in sm.pool_tags[6:] if (r["growth_ps"] or 0) > 16 * 1024]:

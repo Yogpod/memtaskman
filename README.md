@@ -77,6 +77,11 @@ home directories are shown as `~`.
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
   counted once), with anon / file / shmem / kernel breakdown, `memory.max` limits, OOM kills and
   per-cgroup memory pressure in the inspector.
+- **Linux extras**: OOM kills since boot (status line flags new ones) and, in the inspector, each
+  process's OOM score and its place in the OOM killer's queue; zram and zswap under Compressed;
+  KSM savings and hugepage reservations; the largest kernel slab caches (root only); and RAM no
+  process owns: tmpfs mounts, SysV shared memory, and `/dev/shm` / memfd files with the
+  processes holding them.
 - **Memory pressure** (Linux PSI): the percentage of time tasks stalled waiting for memory,
   shown in the status line and as a chart. It's a better out-of-memory signal than "% used".
 - **Kernel pool by tag** (Windows, like `poolmon`): the largest paged / nonpaged pool tags and how

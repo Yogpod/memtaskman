@@ -64,6 +64,8 @@ def collector_checks() -> None:
     check(n > 0, f"runtime identification ran for {n} processes")
     if LINUX:
         check(sm.pressure_some is not None, f"memory pressure (PSI) some={sm.pressure_some}")
+        check(sm.oom_kills is not None, f"OOM kills since boot: {sm.oom_kills}")
+        check(sm.shared is not None and "tmpfs" in sm.shared, "tmpfs / SysV / shm-file accounting")
         check(bool(snap.cgroups), f"{len(snap.cgroups or [])} cgroup rows")
         mine = next((g for g in snap.cgroups or [] if g.cgroup == me.cgroup), None)
         check(mine is not None and mine.count >= 1, f"own cgroup row: {mine and mine.name}")
