@@ -1,6 +1,6 @@
 [project]
 name = "memtaskman"
-version = "0.1.0"
+version = "0.2.0"
 description = "An htop for what's inside your RAM, not just how full it is."
 readme = "README.md"
 requires-python = ">=3.11"
