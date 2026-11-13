@@ -5,13 +5,17 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import psutil
 
+from memtaskman import leaks
 from memtaskman import runtime as rt
 from memtaskman.model import (
     CATEGORY_ORDER,
+    DERIVED,
+    MEASURED,
     HINT,
     Inspection,
     ProcessMem,
@@ -21,17 +25,35 @@ from memtaskman.model import (
 
 WINDOWS = sys.platform == "win32"
 LINUX = sys.platform.startswith("linux")
+MACOS = sys.platform == "darwin"
 
 if WINDOWS:
     from memtaskman import win32 as native
 elif LINUX:
     from memtaskman import linux as native
-else:  # macOS & others: psutil only
+elif MACOS:
+    from memtaskman import macos as native
+else:  # other platforms: psutil only
     native = None
 
 GROWTH_ALPHA = 0.35  # EMA weight for the private-bytes growth rate
 RUNTIME_TTL = 45.0  # seconds before re-checking a process's loaded modules
+LEAK_WINDOW = 600.0  # seconds of private-bytes history kept per process for leak detection
+LEAK_EVERY = 5.0  # re-fit trends at most this often
 PSS_TTL = 2.0  # smaps_rollup makes the kernel walk page tables; refresh visible rows at most this often
+
+
+def unique_column() -> tuple[str, str] | None:
+    """(header, ProcessMem attribute) of the per-platform "real RAM" column, if any.
+
+    Linux: PSS (shared pages split between sharers). Windows: private working set
+    (Task Manager's "Memory" column). Both avoid counting shared pages in full.
+    """
+    if LINUX:
+        return ("PSS", "pss")
+    if WINDOWS:
+        return ("PrivWS", "uss")
+    return None
 
 
 def private_label() -> str:
@@ -39,6 +61,8 @@ def private_label() -> str:
         return "Private"  # private commit charge (Task Manager "Commit size")
     if LINUX:
         return "Anon"  # resident anonymous memory (RssAnon)
+    if MACOS:
+        return "Footprint"  # phys_footprint: Activity Monitor's "Memory" (incl. compressed + GPU)
     return "Private"
 
 
@@ -59,13 +83,19 @@ class _RuntimeEntry:
 
 
 class Collector:
-    def __init__(self, system: bool = True):
+    def __init__(self, system: bool = True, wsl_guest: bool = True):
         self.want_system = system
+        self.wsl_guest = wsl_guest and WINDOWS
         self._pdh = native.PdhQuery() if WINDOWS and system else None
+        self._pws = native.PrivateWorkingSet() if WINDOWS else None
         self._tracks: dict[tuple[int, float], _Track] = {}
         self._runtimes: dict[tuple[int, float], _RuntimeEntry] = {}
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
+        self._cg_tracks: dict[str, _Track] = {}
+        self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
+        self._leaks: dict[tuple[int, float], leaks.Trend] = {}
+        self._leaks_at = 0.0
         self._first = True
         self._lock = threading.RLock()  # sampling and inspection run on different threads
 
@@ -86,12 +116,21 @@ class Collector:
             cached = self._pss.get(p.key)
             if cached:
                 _t, p.pss, p.uss = cached
-        return Snapshot(now, sys.platform, system, procs, private_label())
+        self._update_leaks(now)
+        for p in procs:
+            tr = self._leaks.get(p.key)
+            if tr is not None:
+                p.leak = leaks.describe(tr)
+        snap = Snapshot(now, sys.platform, system, procs, private_label())
+        if LINUX:
+            snap.cgroups = self._cgroup_rows(procs, now)
+        return snap
 
     # ------------------------------------------------------------------ processes
     def _processes(self, now: float) -> list[ProcessMem]:
         out: list[ProcessMem] = []
         seen = set()
+        private_ws = self._pws.sample() if self._pws else {}
         for proc in psutil.process_iter(["pid", "name", "ppid", "create_time", "memory_info"]):
             info = proc.info
             mi = info.get("memory_info")
@@ -114,6 +153,13 @@ class Collector:
                 p.paged_pool = getattr(mi, "paged_pool", None)
                 p.nonpaged_pool = getattr(mi, "nonpaged_pool", None)
                 faults = getattr(mi, "num_page_faults", None)
+                p.uss = private_ws.get(pid)
+            elif MACOS:
+                ru = native.rusage(pid)
+                if ru:
+                    p.private = ru["footprint"]
+                    p.peak = ru["peak"]
+                faults = native.task_faults(pid)
             elif LINUX:
                 st = native.proc_status(pid)
                 if "RssAnon" in st:
@@ -122,13 +168,16 @@ class Collector:
                 p.swapped = st.get("VmSwap")
                 p.peak = st.get("VmHWM")
                 faults = native.proc_faults(pid)
+                cg = native.proc_cgroup(pid)
+                if cg:
+                    p.cgroup = f"{cg[0]}:{cg[1]}"
             self._rates(p, faults, now)
             seen.add(p.key)
             out.append(p)
         for k in list(self._tracks):
             if k not in seen:
                 del self._tracks[k]
-        for cache in (self._runtimes, self._pss):
+        for cache in (self._runtimes, self._pss, self._series, self._leaks):
             for k in list(cache):
                 if k not in seen:
                     del cache[k]
@@ -136,6 +185,12 @@ class Collector:
 
     def _rates(self, p: ProcessMem, faults: int | None, now: float) -> None:
         basis = p.private if p.private is not None else p.resident
+        ser = self._series.get(p.key)
+        if ser is None:
+            ser = self._series[p.key] = deque()
+        ser.append((now, float(basis)))
+        while ser and now - ser[0][0] > LEAK_WINDOW:
+            ser.popleft()
         prev = self._tracks.get(p.key)
         if prev is None:
             self._tracks[p.key] = _Track(now, basis, faults)
@@ -164,6 +219,8 @@ class Collector:
             self._system_windows(sm, procs)
         elif LINUX:
             self._system_linux(sm, now)
+        elif MACOS:
+            self._system_macos(sm, now)
         else:
             sm.free = getattr(vm, "free", None)
             sm.cached = getattr(vm, "inactive", None)
@@ -178,6 +235,12 @@ class Collector:
             sb = [c.get(k) for k in ("standby_core", "standby_normal", "standby_reserve")]
             if any(v is not None for v in sb):
                 sm.standby = int(sum(v or 0 for v in sb))
+                # Reuse order when RAM is needed: reserve first, then normal, core last.
+                for key, label in (("standby_reserve", "Standby: reserve (reused 1st)"),
+                                   ("standby_normal", "Standby: normal (reused 2nd)"),
+                                   ("standby_core", "Standby: core (reused last)")):
+                    if c.get(key) is not None:
+                        sm.extra[label] = int(c[key])
             if "modified" in c:
                 sm.modified = int(c["modified"])
             if "free_zero" in c:
@@ -208,8 +271,36 @@ class Collector:
             sm.compressed = comp.resident
         self._first = False
 
+    def _system_macos(self, sm: SystemMemory, now: float) -> None:
+        sm.source = "host_statistics64 + sysctl"
+        v = native.vm_stats()
+        if v is None:
+            return
+        b = native.vm_breakdown(v, native.page_size())
+        sm.used = b["used"]
+        sm.available = max(0, sm.total - sm.used)
+        sm.free = b["free"]
+        sm.cached = b["cached"]
+        sm.compressed = b["compressed"]
+        sm.kernel_nonpaged = b["wired"]
+        sm.pressure_level = native.pressure_level()
+        sm.extra["App memory"] = b["app"]
+        sm.extra["Wired"] = b["wired"]
+        sm.extra["Purgeable"] = b["purgeable"]
+        if b["compressed_original"]:
+            sm.extra["Compressed (original size)"] = b["compressed_original"]
+        if self._vm_prev:
+            t0, prev = self._vm_prev
+            dt = now - t0
+            if dt > 0:
+                sm.page_faults_ps = (v["faults"] - prev["faults"]) / dt
+                sm.hard_faults_ps = (v["pageins"] - prev["pageins"]) / dt
+        self._vm_prev = (now, v)
+
     def _system_linux(self, sm: SystemMemory, now: float) -> None:
         sm.source = "/proc/meminfo + /proc/vmstat"
+        if native.is_wsl():
+            sm.vm_note = native.WSL_NOTE
         mi = native.meminfo()
         sm.free = mi.get("MemFree")
         sm.cached = mi.get("Cached", 0) + mi.get("Buffers", 0) if "Cached" in mi else None
@@ -224,6 +315,10 @@ class Collector:
                          ("Zswapped", "Zswapped (uncompressed)")):
             if k in mi:
                 sm.extra[label] = mi[k]
+        psi = native.pressure()
+        if psi:
+            sm.pressure_some = psi.get("some", {}).get("avg10")
+            sm.pressure_full = psi.get("full", {}).get("avg10")
         vs = native.vmstat()
         if self._vm_prev and vs:
             t0, prev = self._vm_prev
@@ -232,6 +327,72 @@ class Collector:
                 sm.page_faults_ps = (vs["pgfault"] - prev["pgfault"]) / dt
                 sm.hard_faults_ps = (vs.get("pgmajfault", 0) - prev.get("pgmajfault", 0)) / dt
         self._vm_prev = (now, vs)
+
+    def _update_leaks(self, now: float) -> None:
+        if now - self._leaks_at < LEAK_EVERY:
+            return
+        self._leaks_at = now
+        found = {}
+        for key, ser in self._series.items():
+            if len(ser) < leaks.MIN_POINTS or ser[-1][0] - ser[0][0] < leaks.MIN_SPAN_S:
+                continue
+            tr = leaks.fit(list(ser))
+            if tr is not None and tr.is_leak:
+                found[key] = tr
+        self._leaks = found
+
+    # ------------------------------------------------------------------ cgroups (Linux)
+    def _cgroup_rows(self, procs: list[ProcessMem], now: float) -> list[ProcessMem]:
+        """One row per leaf cgroup. Sizes come from the kernel's cgroup accounting, so shared
+        pages are charged once (to the cgroup that first touched them), never per member."""
+        members: dict[str, list[ProcessMem]] = {}
+        for p in procs:
+            if p.cgroup:
+                members.setdefault(p.cgroup, []).append(p)
+        rows = []
+        for key, ms in members.items():
+            kind, _, path = key.partition(":")
+            stats = native.cgroup_stats(kind, path)
+            row = ProcessMem(
+                pid=min(m.pid for m in ms), name=native.cgroup_label(path), ppid=0, create_time=0.0,
+                resident=0, private=None, count=len(ms), cgroup=key, cgroup_stats=stats,
+            )
+            if stats:
+                row.resident = stats["current"]
+                row.private = stats.get("anon")
+                row.shared = (stats.get("file") or 0) + (stats.get("shmem") or 0) if stats.get("file") is not None else None
+                row.swapped = stats.get("swap")
+            else:  # root cgroup / unreadable: fall back to member sums (an upper bound)
+                row.resident = sum(m.resident for m in ms)
+                row.private = sum(m.private or 0 for m in ms) if any(m.private is not None for m in ms) else None
+            row.pss = sum(m.pss for m in ms if m.pss is not None) if any(m.pss is not None for m in ms) else None
+            row.faults_ps = sum(m.faults_ps for m in ms if m.faults_ps is not None) if any(m.faults_ps is not None for m in ms) else None
+            row.runtime = next((m.runtime for m in sorted(ms, key=lambda m: -m.resident) if m.runtime), None)
+            basis = row.private if row.private is not None else row.resident
+            tr = self._cg_tracks.get(key)
+            if tr is None:
+                self._cg_tracks[key] = _Track(now, basis, None)
+            elif now - tr.t > 0.05:
+                inst = (basis - tr.private) / (now - tr.t)
+                tr.growth = inst if tr.growth is None else GROWTH_ALPHA * inst + (1 - GROWTH_ALPHA) * tr.growth
+                tr.t, tr.private = now, basis
+                row.growth_ps = tr.growth
+            else:
+                row.growth_ps = tr.growth
+            rows.append(row)
+        for k in list(self._cg_tracks):
+            if k not in members:
+                del self._cg_tracks[k]
+        # Disambiguate identical labels (e.g. /init.scope vs user@1000.service/init.scope).
+        seen: dict[str, int] = {}
+        for r in rows:
+            seen[r.name] = seen.get(r.name, 0) + 1
+        for r in rows:
+            if seen[r.name] > 1:
+                parts = [p for p in r.cgroup.partition(":")[2].split("/") if p]
+                if len(parts) >= 2:
+                    r.name = f"{r.name} ({parts[-2].removesuffix('.service').removesuffix('.slice')})"
+        return rows
 
     # ------------------------------------------------------------------ runtimes
     def resolve_runtimes(self, procs: list[ProcessMem], *, time_budget: float = 0.25) -> int:
@@ -283,7 +444,7 @@ class Collector:
         mods: list[str] = []
         if native is not None and p.pid > 4:
             try:
-                mods = (native.module_names(p.pid) if WINDOWS else native.mapped_paths(p.pid)) or []
+                mods = native.module_names(p.pid) or []
             except OSError:
                 mods = []
         try:
@@ -306,11 +467,16 @@ class Collector:
                 ins = native.inspect(p.pid, p.name)
             except Exception as e:  # noqa: BLE001 - a racing process exit can surface many error types
                 ins = Inspection(p.pid, p.name, error=f"{type(e).__name__}: {e}")
+        if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
+            self._add_wsl_guest(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
                 self._runtimes[p.key] = self._identify(p, time.time())
             info, cmd = self.runtime_of(p.key)
+            tr = self._leaks.get(p.key)
+        if tr is not None:
+            ins.evidence.insert(0, (DERIVED, "possible leak: " + leaks.describe(tr)))
         ins.cmdline = cmd
         if info:
             ins.evidence = [e for e in info.evidence if e[1]] + ins.evidence
@@ -318,9 +484,44 @@ class Collector:
             ins.evidence.insert(0, (HINT, "no known runtime recognised"))
         return ins
 
+    def _add_wsl_guest(self, ins: Inspection, p: ProcessMem) -> None:
+        from memtaskman import wslhost
+        from memtaskman.fmt import fmt_bytes
+
+        guest, why = wslhost.guest_memory()
+        if guest is None:
+            ins.evidence.append((HINT, f"guest view unavailable: {why}"))
+            return
+        ins.guest = guest
+        if ins.error and "access denied" in ins.error:
+            ins.error = None  # expected for the VM process; the guest view below is what matters
+            ins.evidence.append((MEASURED, "VM process address space is not inspectable; showing the guest's view"))
+        used, cache = guest.get("used"), guest.get("reclaimable_cache")
+        ins.evidence.append((MEASURED, f"guest {guest['distro']}: {fmt_bytes(used)} used, "
+                                       f"{fmt_bytes(guest.get('cache'))} page cache, {fmt_bytes(guest.get('free'))} free "
+                                       f"(of {fmt_bytes(guest.get('total'))})"))
+        if used is not None and p.resident > used:
+            ins.evidence.append((DERIVED, f"Windows holds {fmt_bytes(p.resident)} for the VM but the guest only uses "
+                                          f"{fmt_bytes(used)}: the other {fmt_bytes(p.resident - used)} is guest cache / "
+                                          f"freed pages not yet returned"))
+        cfg = wslhost.read_wslconfig()
+        limit = cfg.get("wsl2.memory")
+        ins.evidence.append((HINT, f".wslconfig memory={limit} caps the VM" if limit else
+                             "no memory= limit in .wslconfig: the VM may grow to half of RAM by default"))
+        reclaim = cfg.get("experimental.automemoryreclaim") or cfg.get("wsl2.automemoryreclaim")
+        if reclaim:
+            ins.evidence.append((HINT, f"autoMemoryReclaim={reclaim} is set"))
+        else:
+            ins.evidence.append((HINT, "autoMemoryReclaim=gradual in .wslconfig returns idle cache to Windows"))
+        if cache:
+            ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
+                                       "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
+
     def close(self) -> None:
         if self._pdh:
             self._pdh.close()
+        if self._pws:
+            self._pws.close()
 
 
 # ---------------------------------------------------------------------- aggregation
@@ -372,6 +573,7 @@ SORTS = {
     "resident": lambda p: p.resident,
     "private": lambda p: p.private or 0,
     "pss": lambda p: p.pss or 0,
+    "uss": lambda p: p.uss or 0,
     "growth": lambda p: p.growth_ps or 0,
     "faults": lambda p: p.faults_ps or 0,
     "name": lambda p: p.name.lower(),

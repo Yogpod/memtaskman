@@ -16,8 +16,10 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Sparkline, Static
 
-from memtaskman.collector import LINUX, WINDOWS, Collector, group_by_app, sort_procs
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct
+from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, sort_procs, unique_column
+
+UNIQUE = unique_column()
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
 from memtaskman.model import DERIVED, HINT, IDENTIFIED, MEASURED, Inspection, ProcessMem, Snapshot, SystemMemory
 
 HISTORY = 120
@@ -41,6 +43,11 @@ CHARTS = [
     ("faults", "Page faults/s", "rate"),
     ("hard", "Hard faults/s (disk)", "rate"),
 ]
+if LINUX:  # zswap is often off; memory pressure (PSI) is the better Linux signal
+    CHARTS[3] = ("pressure", "Memory pressure (PSI some %)", "pct")
+if MACOS:  # macOS has no commit charge; wired memory is the more useful series
+    CHARTS[1] = ("wired", "Wired", "bytes")
+GROUP_MODES = ["none", "app"] + (["cgroup"] if LINUX else [])
 
 LEVEL_STYLE = {MEASURED: "green", DERIVED: "cyan", IDENTIFIED: "magenta", HINT: "yellow"}
 
@@ -61,7 +68,12 @@ HELP = f"""\
   Anon        Linux: resident anonymous memory (RssAnon)
   PSS         Linux: resident, with each shared page split between its sharers; sums to real RAM use
               (read from smaps_rollup for visible rows; blank for other users' processes unless run as root)
+  PrivWS      Windows: private working set, Task Manager's "Memory" column. Pages only this process
+              can use; slightly below tools that count shared-but-unshared pages as unique
   Growth      smoothed change of Private per second — a steadily positive value is how leaks look
+  ▲ name      possible leak: private bytes rose in a straight line (R² ≥ 0.85) by ≥ 16 MiB and ≥ 5%
+              over at least 2 minutes of the last 10. GC sawtooth patterns are not flagged.
+              For long runs: mtm record out.jsonl, then mtm summary out.jsonl
   Faults/s    page faults per second (soft + hard)
   Pool/Swap   Windows: kernel pool charged to the process / Linux: swapped-out bytes
 
@@ -74,7 +86,15 @@ HELP = f"""\
   Evidence: [green]measured[/] OS counter · [cyan]derived[/] computed by memtaskman ·
             [magenta]identified[/] from loaded modules · [yellow]hint[/] a configured limit, not usage
 
-[b]Keys[/b]  ↑/↓ select  s sort  g group by app  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Grouping[/b] (g cycles)
+  by app      every process with the same executable summed (resident double counts shared pages)
+  by cgroup   Linux: one row per systemd service / container / session, sized by the kernel's
+              cgroup accounting (memory.current), with limits, OOM kills and per-cgroup pressure
+
+[b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
+  waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
+
+[b]Keys[/b]  ↑/↓ select  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -102,6 +122,12 @@ def stacked_bar(segments: list[tuple[str, int, str]], total: int, width: int) ->
 
 
 def ram_segments(sm: SystemMemory) -> list[tuple[str, int, str]]:
+    if "App memory" in sm.extra:  # macOS, Activity Monitor's split
+        used = sm.extra["App memory"] + sm.extra.get("Wired", 0) + (sm.compressed or 0)
+        cached = min(sm.cached or 0, max(0, sm.total - used))
+        free = max(0, sm.total - used - cached)
+        return [("App", sm.extra["App memory"], C_USED), ("Wired", sm.extra.get("Wired", 0), C_MOD),
+                ("Compressed", sm.compressed or 0, C_COMMIT), ("Cached files", cached, C_STANDBY), ("Free", free, C_FREE)]
     if sm.standby is not None:  # Windows
         mod = sm.modified or 0
         in_use = max(0, sm.used - mod)
@@ -144,15 +170,17 @@ class MemTaskManApp(App):
         Binding("question_mark", "help", "Help", key_display="?"),
     ]
 
-    def __init__(self, interval: float = 1.0, system: bool = True):
+    def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
+                 privacy: bool = False):
         super().__init__()
+        self.privacy = privacy  # hide command lines and home-directory paths (screenshots, demos)
         self.interval = max(0.25, interval)
-        self.collector = Collector(system=system)
+        self.collector = Collector(system=system, wsl_guest=wsl_guest)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
-        self.sort_keys = ["resident"] + (["pss"] if LINUX else []) + ["private", "growth", "faults", "name", "pid"]
+        self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
         self.show_all = False
-        self.grouped = False
+        self.group_mode = "none"  # none | app | cgroup (Linux)
         self.paused = False
         self.chart_mode = -1  # -1 = all charts, else index into CHARTS
         self.snapshot: Snapshot | None = None
@@ -162,6 +190,10 @@ class MemTaskManApp(App):
         self.inspection: Inspection | None = None
 
     # ------------------------------------------------------------------ layout
+    @property
+    def grouped(self) -> bool:
+        return self.group_mode != "none"
+
     def compose(self) -> ComposeResult:
         yield Static(id="top")
         with Grid(id="charts"):
@@ -191,8 +223,8 @@ class MemTaskManApp(App):
         t.add_column(first, key="pid", width=7)
         t.add_column("Name", key="name", width=26)
         t.add_column("Resident", key="resident", width=9)
-        if LINUX:
-            t.add_column("PSS", key="pss", width=9)
+        if UNIQUE:
+            t.add_column(UNIQUE[0], key=UNIQUE[1], width=9)
         t.add_column(pl, key="private", width=9)
         t.add_column("Growth", key="growth", width=10)
         t.add_column("Faults/s", key="faults", width=8)
@@ -212,7 +244,9 @@ class MemTaskManApp(App):
     @work(thread=True, exclusive=True, group="sample")
     def sample(self) -> None:
         snap = self.collector.sample()
-        visible = self._ordered(snap.processes)[: TOP_N if not self.show_all else None]
+        visible = sort_procs(snap.processes, "resident")[: TOP_N if not self.show_all else None]
+        if self.group_mode == "none":
+            visible = self._ordered(snap)[: TOP_N if not self.show_all else None]
         self.collector.resolve_runtimes(visible + sort_procs(snap.processes, "resident"), time_budget=0.3)
         self.collector.refresh_pss(visible, time_budget=0.2)
         self.call_from_thread(self.apply, snap)
@@ -234,13 +268,15 @@ class MemTaskManApp(App):
             "commit": sm.commit_used,
             "cache": sm.standby if sm.standby is not None else sm.cached,
             "compressed": sm.compressed,
+            "pressure": sm.pressure_some,
+            "wired": sm.kernel_nonpaged,
             "swap": sm.swap_used,
             "kernel": (sm.kernel_paged or 0) + (sm.kernel_nonpaged or 0) if sm.kernel_paged is not None else None,
             "faults": sm.page_faults_ps,
             "hard": sm.hard_faults_ps,
         }
         for k, v in vals.items():
-            if v is not None:
+            if v is not None and k in self.history:  # only series that have a chart on this platform
                 self.history[k].append(float(v))
 
     # ------------------------------------------------------------------ rendering
@@ -251,8 +287,17 @@ class MemTaskManApp(App):
         lines: list[Text] = []
         status = Text()
         status.append("memtaskman", style="bold")
-        status.append(f"  sort:{self.sort_key}  {'grouped by app' if self.grouped else 'per process'}"
+        mode = {"none": "per process", "app": "grouped by app", "cgroup": "grouped by cgroup"}[self.group_mode]
+        status.append(f"  sort:{self.sort_key}  {mode}"
                       f"  {'all' if self.show_all else f'top {TOP_N}'}  {len(snap.processes)} processes", style="dim")
+        sm0 = snap.system
+        if sm0 and sm0.pressure_some is not None:
+            full = sm0.pressure_full or 0.0
+            style = "bold red" if full >= 5 else "yellow" if sm0.pressure_some >= 5 else "dim"
+            status.append(f"  pressure some {sm0.pressure_some:.1f}% full {full:.1f}%", style=style)
+        if sm0 and sm0.pressure_level:
+            style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
+            status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
         if self.paused:
             status.append("  PAUSED", style="bold yellow")
         lines.append(status)
@@ -296,6 +341,9 @@ class MemTaskManApp(App):
             if kind == "bytes":
                 val = fmt_bytes(cur)
                 rng = f"  [{fmt_bytes(min(data))}-{fmt_bytes(max(data))}]" if len(data) > 1 else ""
+            elif kind == "pct":
+                val = f"{cur:.1f}%" if cur is not None else "-"
+                rng = f"  [peak {max(data):.1f}%]" if data else ""
             else:
                 val = fmt_count_rate(cur)
                 rng = f"  [peak {fmt_count_rate(max(data))}]" if data else ""
@@ -308,6 +356,7 @@ class MemTaskManApp(App):
         if not sm:
             w.update("[dim]system counters disabled[/dim]")
             return
+        note = Text(sm.vm_note, style="yellow") if sm.vm_note else None
         t = Table.grid(padding=(0, 1))
         t.add_column(style="dim")
         t.add_column(justify="right")
@@ -324,24 +373,30 @@ class MemTaskManApp(App):
         for label, value, note in rows:
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
-        w.update(Group(Text("System", style="bold"), t))
+        w.update(Group(Text("System", style="bold"), t, *([note] if note else [])))
 
-    def _ordered(self, procs: list[ProcessMem]) -> list[ProcessMem]:
-        if self.grouped:
-            procs = group_by_app(procs)
+    def _ordered(self, snap: Snapshot) -> list[ProcessMem]:
+        if self.group_mode == "cgroup" and snap.cgroups is not None:
+            procs = snap.cgroups
+        elif self.group_mode == "app":
+            procs = group_by_app(snap.processes)
+        else:
+            procs = snap.processes
         return sort_procs(procs, self.sort_key)
 
     def _row_key(self, p: ProcessMem) -> str:
-        return f"g:{p.name.lower()}" if self.grouped else f"p:{p.pid}:{p.create_time}"
+        if self.group_mode == "cgroup":
+            return f"c:{p.cgroup}"
+        return f"g:{p.name.lower()}" if self.group_mode == "app" else f"p:{p.pid}:{p.create_time}"
 
     def render_table(self) -> None:
         t = self.query_one("#procs", DataTable)
-        procs = self._ordered(self.snapshot.processes)
+        procs = self._ordered(self.snapshot)
         if not self.show_all:
             procs = procs[:TOP_N]
         if self.selected and not any(self._row_key(p) == self.selected for p in procs):
             # Keep the selected process visible even when it drops out of the top N.
-            sel = next((p for p in self._ordered(self.snapshot.processes) if self._row_key(p) == self.selected), None)
+            sel = next((p for p in self._ordered(self.snapshot) if self._row_key(p) == self.selected), None)
             if sel:
                 procs.append(sel)
         scroll_y = t.scroll_y
@@ -359,13 +414,24 @@ class MemTaskManApp(App):
                 growth.stylize("green")
             extra = (p.paged_pool or 0) + (p.nonpaged_pool or 0) if WINDOWS and p.paged_pool is not None else p.swapped
             rt = f"{p.runtime or ''} {p.runtime_detail or ''}".strip()
+            if p.cgroup_stats is not None:
+                cs = p.cgroup_stats
+                bits = []
+                if cs.get("max") is not None:
+                    bits.append(f"limit {fmt_bytes(cs['max'])}")
+                if cs.get("oom_kill"):
+                    bits.append(f"{cs['oom_kill']} OOM kill(s)")
+                rt = " · ".join(bits) or rt
+            name = Text(p.name)
+            if p.leak:
+                name = Text("▲ ", style="bold red").append(p.name, style="red")
             cells = [
                 Text(f"×{p.count}" if self.grouped else str(p.pid), justify="right"),
-                p.name,
+                name,
                 Text(fmt_bytes(p.resident), justify="right"),
             ]
-            if LINUX:
-                cells.append(Text(fmt_bytes(p.pss), justify="right"))
+            if UNIQUE:
+                cells.append(Text(fmt_bytes(getattr(p, UNIQUE[1])), justify="right"))
             t.add_row(
                 *cells,
                 Text(fmt_bytes(p.private), justify="right"),
@@ -400,6 +466,10 @@ class MemTaskManApp(App):
         p = self.rows.get(self.selected)
         if p is None:
             return
+        if self.group_mode == "cgroup":
+            self.last_inspect = time.monotonic()
+            self.show_cgroup(p)
+            return
         if self.grouped:
             members = [q for q in self.snapshot.processes if q.name.lower() == p.name.lower()]
             if not members:
@@ -409,6 +479,63 @@ class MemTaskManApp(App):
             target = p
         self.last_inspect = time.monotonic()
         self.inspect_worker(target, p.count)
+
+    def show_cgroup(self, row: ProcessMem) -> None:
+        parts: list = []
+        head = Text()
+        head.append(row.name, style="bold")
+        head.append(f"  cgroup  ×{row.count} processes", style="dim")
+        parts.append(head)
+        parts.append(Text(row.cgroup.partition(":")[2] if row.cgroup else "", style="dim"))
+        cs = row.cgroup_stats
+        if cs is None:
+            parts.append(Text("No memory accounting for this cgroup (root cgroup, or the memory controller is not "
+                              "enabled here). Sizes are sums of member processes: an upper bound.", style="yellow"))
+        else:
+            t = Table(box=None, padding=(0, 1), show_edge=False, show_header=False)
+            t.add_column(style="dim")
+            t.add_column(justify="right")
+            t.add_column(style="dim")
+            total = cs["current"] or 1
+            for label, key, note in (("Charged", "current", "memory.current"), ("Anonymous", "anon", "heap, stacks"),
+                                     ("File cache", "file", "reclaimable"), ("Shmem", "shmem", "tmpfs / shared"),
+                                     ("Kernel", "kernel", "slab, page tables"), ("Sockets", "sock", "network buffers"),
+                                     ("Swap", "swap", "")):
+                v = cs.get(key)
+                if v is not None:
+                    note_t = Text(note + " ")
+                    if key != "current":
+                        note_t.append("█" * round(8 * v / total), style=C_USED)
+                    t.add_row(label, fmt_bytes(v), note_t)
+            parts.append(t)
+            lim = Text("\nLimits  ", style="bold")
+            lim.append(f"max {fmt_bytes(cs['max']) if cs.get('max') is not None else 'unlimited'}   ")
+            lim.append(f"high {fmt_bytes(cs['high']) if cs.get('high') is not None else 'unlimited'}")
+            if cs.get("max"):
+                lim.append(f"   ({100 * cs['current'] / cs['max']:.0f}% used)", style="dim")
+            parts.append(lim)
+            oom = cs.get("oom")
+            kills = cs.get("oom_kill")
+            ev = Text("Events  ", style="bold")
+            ev.append(f"oom {'-' if oom is None else oom}   oom_kill {'-' if kills is None else kills}")
+            parts.append(ev)
+            psi = cs.get("pressure")
+            if psi:
+                parts.append(Text(f"Pressure  some {psi.get('some', {}).get('avg10', 0):.1f}%  "
+                                  f"full {psi.get('full', {}).get('avg10', 0):.1f}% (avg10)", style="bold"))
+        members = sorted((q for q in self.snapshot.processes if q.cgroup == row.cgroup), key=lambda q: -q.resident)
+        if members:
+            parts.append(Text("\nMembers (by resident)", style="bold"))
+            mt = Table(box=None, padding=(0, 1), show_edge=False, show_header=False)
+            mt.add_column(justify="right", style="dim")
+            mt.add_column()
+            mt.add_column(justify="right")
+            for q in members[:10]:
+                mt.add_row(str(q.pid), q.name, fmt_bytes(q.resident))
+            parts.append(mt)
+        parts.append(Text("\nmeasured: kernel cgroup accounting; shared pages are charged once, to the cgroup "
+                          "that first used them", style="dim"))
+        self.query_one("#inspect-body", Static).update(Group(*parts))
 
     @work(thread=True, exclusive=True, group="inspect")
     def inspect_worker(self, p: ProcessMem, group_count: int) -> None:
@@ -426,6 +553,24 @@ class MemTaskManApp(App):
         parts.append(head)
         if ins.error:
             parts.append(Text(ins.error, style="red"))
+        if ins.guest:
+            g = ins.guest
+            parts.append(Text(f"\nInside the WSL2 VM ({g['distro']})", style="bold"))
+            gt = Table(box=None, padding=(0, 1), show_edge=False, show_header=False)
+            gt.add_column(style="dim")
+            gt.add_column(justify="right")
+            gt.add_column()
+            total = g.get("total") or 1
+            for label, key, color in (("Used by Linux", "used", C_USED), ("  anonymous", "anon", C_USED),
+                                      ("Page cache", "cache", C_STANDBY), ("  of which tmpfs", "shmem", C_MOD),
+                                      ("Free", "free", C_FREE), ("VM size", "total", "")):
+                v = g.get(key)
+                if v is not None:
+                    bar = Text("█" * round(16 * v / total), style=color) if color else Text("")
+                    gt.add_row(label, fmt_bytes(v), bar)
+            parts.append(gt)
+            parts.append(Text("read on demand while this row is selected; WSL is never started",
+                              style="dim"))
         if ins.categories:
             total_res = sum(c.resident or 0 for c in ins.categories) or 1
             t = Table(box=None, padding=(0, 1), show_edge=False, header_style="bold dim")
@@ -447,7 +592,7 @@ class MemTaskManApp(App):
             ft.add_column(justify="right")
             ft.add_column(no_wrap=True, overflow="ellipsis")
             for f in ins.top_files:
-                pp = PureWindowsPath(f.path)
+                pp = PureWindowsPath(redact(f.path) if self.privacy else f.path)
                 label = Text(pp.name)
                 parent = str(pp.parent)
                 label.append("  " + (parent if len(parent) <= 30 else "…" + parent[-29:]), style="dim")
@@ -456,11 +601,12 @@ class MemTaskManApp(App):
         if ins.evidence:
             parts.append(Text("\nEvidence", style="bold"))
             for level, text in ins.evidence:
+                text = redact(text) if self.privacy else text
                 line = Text()
-                line.append(f"{level:<10}", style=LEVEL_STYLE.get(level, ""))
+                line.append(f"{level:<11}", style=LEVEL_STYLE.get(level, ""))
                 line.append(text)
                 parts.append(line)
-        if ins.cmdline:
+        if ins.cmdline and not self.privacy:
             parts.append(Text("\n" + " ".join(ins.cmdline)[:300], style="dim"))
         parts.append(Text(f"\ninspected in {ins.elapsed * 1000:.0f} ms, refreshes every {INSPECT_EVERY:.0f}s", style="dim"))
         self.query_one("#inspect-body", Static).update(Group(*parts))
@@ -477,7 +623,12 @@ class MemTaskManApp(App):
         self._refresh_now()
 
     def action_group(self) -> None:
-        self.grouped = not self.grouped
+        modes = list(GROUP_MODES)
+        if self.snapshot is not None and self.snapshot.cgroups is None and "cgroup" in modes:
+            modes.remove("cgroup")
+        self.group_mode = modes[(modes.index(self.group_mode) + 1) % len(modes)] if self.group_mode in modes else "none"
+        if self.group_mode == "cgroup":
+            self.notify("grouped by cgroup: sizes are the kernel's cgroup accounting", timeout=2)
         self.selected = None
         self._setup_columns()
         self._refresh_now()

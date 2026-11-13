@@ -127,6 +127,86 @@ def summarize_smaps(maps: list[dict], top_files: int = 12) -> tuple[list[Categor
     return list(cats.values()), top
 
 
+def parse_psi(text: str) -> dict[str, dict[str, float]]:
+    """/proc/pressure/memory (or a cgroup's memory.pressure) -> {"some": {"avg10": ..}, "full": {..}}."""
+    out: dict[str, dict[str, float]] = {}
+    for line in text.splitlines():
+        kind, _, rest = line.partition(" ")
+        vals = {}
+        for field in rest.split():
+            k, _, v = field.partition("=")
+            try:
+                vals[k] = float(v)
+            except ValueError:
+                pass
+        if kind in ("some", "full") and vals:
+            out[kind] = vals
+    return out
+
+
+def parse_flat_keyed(text: str) -> dict[str, int]:
+    """'key value' lines (memory.stat, memory.events) -> ints."""
+    out = {}
+    for line in text.splitlines():
+        k, _, v = line.partition(" ")
+        if v.strip().lstrip("-").isdigit():
+            out[k] = int(v)
+    return out
+
+
+def parse_limit(text: str | None) -> int | None:
+    """memory.max / memory.high: 'max' (unlimited) -> None."""
+    if text is None:
+        return None
+    t = text.strip()
+    if not t.isdigit():
+        return None
+    v = int(t)
+    return None if v >= 1 << 60 else v  # v1 reports 'unlimited' as a huge number
+
+
+def parse_proc_cgroup(text: str) -> tuple[str, str] | None:
+    """/proc/<pid>/cgroup -> ("v2", path) or ("v1", memory-controller path)."""
+    v1 = None
+    for line in text.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        hid, controllers, path = parts
+        if hid == "0" and controllers == "":
+            return ("v2", path)
+        if "memory" in controllers.split(","):
+            v1 = ("v1", path)
+    return v1
+
+
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def cgroup_label(path: str) -> str:
+    """Human name for a cgroup path."""
+    if path in ("", "/"):
+        return "(root cgroup)"
+    parts = [p for p in path.split("/") if p]
+    leaf = parts[-1]
+    m = _HEX64.search(leaf)
+    if m:
+        cid = m.group(0)[:12]
+        if "docker" in path:
+            return f"docker:{cid}"
+        if "kubepods" in path:
+            pm = re.search(r"[-/]pod([0-9a-f]{8})", path)
+            return f"pod:{pm.group(1)}/{cid}" if pm else f"k8s:{cid}"
+        if "libpod" in path or "podman" in path:
+            return f"podman:{cid}"
+        return f"container:{cid}"
+    if leaf.endswith(".scope") and len(parts) >= 2 and parts[-2].startswith("user-"):
+        return f"{leaf} ({parts[-2].removesuffix('.slice')})"
+    if leaf.startswith("app-") and leaf.endswith(".scope"):
+        return leaf.removeprefix("app-").removesuffix(".scope").split("@")[0]
+    return leaf
+
+
 # --------------------------------------------------------------------------- live readers
 
 
@@ -175,6 +255,66 @@ def mapped_paths(pid: int) -> list[str] | None:
     return sorted(names)
 
 
+def pressure() -> dict[str, dict[str, float]] | None:
+    """System memory PSI, or None when the kernel has PSI disabled."""
+    t = _read("/proc/pressure/memory")
+    return parse_psi(t) if t else None
+
+
+def proc_cgroup(pid: int) -> tuple[str, str] | None:
+    t = _read(f"/proc/{pid}/cgroup")
+    return parse_proc_cgroup(t) if t else None
+
+
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def cgroup_stats(kind: str, path: str) -> dict | None:
+    """Kernel-accounted memory for one cgroup. None if the directory is unreadable."""
+    if kind == "v2":
+        base = CGROUP_ROOT + path.rstrip("/")
+        current = _read(base + "/memory.current")
+        if current is None or not current.strip().isdigit():
+            return None
+        stat = parse_flat_keyed(_read(base + "/memory.stat") or "")
+        events = parse_flat_keyed(_read(base + "/memory.events") or "")
+        swap = _read(base + "/memory.swap.current")
+        psi = _read(base + "/memory.pressure")
+        return {
+            "current": int(current),
+            "anon": stat.get("anon"),
+            "file": stat.get("file"),
+            "shmem": stat.get("shmem"),
+            "kernel": stat.get("kernel"),
+            "sock": stat.get("sock"),
+            "swap": int(swap) if swap and swap.strip().isdigit() else None,
+            "max": parse_limit(_read(base + "/memory.max")),
+            "high": parse_limit(_read(base + "/memory.high")),
+            "oom": events.get("oom"),
+            "oom_kill": events.get("oom_kill"),
+            "pressure": parse_psi(psi) if psi else None,
+        }
+    base = f"{CGROUP_ROOT}/memory" + path.rstrip("/")
+    usage = _read(base + "/memory.usage_in_bytes")
+    if usage is None or not usage.strip().isdigit():
+        return None
+    stat = parse_flat_keyed(_read(base + "/memory.stat") or "")
+    return {
+        "current": int(usage),
+        "anon": stat.get("total_rss", stat.get("rss")),
+        "file": stat.get("total_cache", stat.get("cache")),
+        "shmem": stat.get("total_shmem", stat.get("shmem")),
+        "kernel": None, "sock": None, "swap": stat.get("total_swap"),
+        "max": parse_limit(_read(base + "/memory.limit_in_bytes")),
+        "high": None, "oom": None,
+        "oom_kill": parse_flat_keyed(_read(base + "/memory.oom_control") or "").get("oom_kill"),
+        "pressure": None,
+    }
+
+
+module_names = mapped_paths  # same interface as win32 / macos
+
+
 def inspect(pid: int, name: str, *, top_files: int = 12) -> Inspection:
     t0 = time.perf_counter()
     ins = Inspection(pid=pid, name=name)
@@ -192,6 +332,18 @@ def inspect(pid: int, name: str, *, top_files: int = 12) -> Inspection:
     ins.evidence.append((DERIVED, "categories assigned from mapping names and permissions"))
     ins.elapsed = time.perf_counter() - t0
     return ins
+
+
+def is_wsl() -> bool:
+    if os.path.exists("/proc/sys/fs/binfmt_misc/WSLInterop") or os.path.exists("/run/WSL"):
+        return True
+    rel = (_read("/proc/sys/kernel/osrelease") or "").lower()
+    return "microsoft" in rel and "wsl" in rel
+
+
+WSL_NOTE = ("WSL2 VM: this RAM is the Windows process vmmemWSL. Page cache here still holds host RAM "
+            "until reclaimed. Cap it with [wsl2] memory= in %UserProfile%\\.wslconfig; "
+            "autoMemoryReclaim returns cache to Windows")
 
 
 def is_linux() -> bool:

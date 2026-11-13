@@ -35,7 +35,11 @@ class SystemMemory:
     kernel_nonpaged: int | None = None  # Win nonpaged pool / Linux unreclaimable slab
     page_faults_ps: float | None = None
     hard_faults_ps: float | None = None  # pages read from disk per second
+    pressure_some: float | None = None  # Linux PSI: % of time some task stalled on memory (avg10)
+    pressure_full: float | None = None  # Linux PSI: % of time all tasks stalled on memory (avg10)
+    pressure_level: str | None = None  # macOS: normal / warn / critical (kern.memorystatus_vm_pressure_level)
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
+    vm_note: str | None = None  # e.g. "this is a WSL2 VM" when running inside one
     source: str = "psutil"
 
     def to_dict(self) -> dict[str, Any]:
@@ -62,6 +66,9 @@ class ProcessMem:
     runtime: str | None = None
     runtime_detail: str | None = None
     count: int = 1  # >1 when this row aggregates several processes (group-by-app view)
+    leak: str | None = None  # description when growth has been steady for minutes (see leaks.py)
+    cgroup: str | None = None  # Linux cgroup path (per process) or the group's path (cgroup rows)
+    cgroup_stats: dict | None = None  # kernel accounting for cgroup rows (memory.current, stat, limits)
 
     @property
     def key(self) -> tuple[int, float]:
@@ -78,6 +85,7 @@ class Snapshot:
     system: SystemMemory | None
     processes: list[ProcessMem]
     private_label: str = "Private"  # what "private" means on this platform
+    cgroups: list[ProcessMem] | None = None  # Linux: one row per cgroup, from kernel accounting
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +95,7 @@ class Snapshot:
             "private_label": self.private_label,
             "system": self.system.to_dict() if self.system else None,
             "processes": [p.to_dict() for p in self.processes],
+            "cgroups": [g.to_dict() for g in self.cgroups] if self.cgroups is not None else None,
         }
 
 
@@ -119,6 +128,7 @@ class Inspection:
     reserved: int | None = None  # address space reserved but not committed (Win)
     evidence: list[tuple[str, str]] = field(default_factory=list)  # (level, text)
     cmdline: list[str] = field(default_factory=list)
+    guest: dict | None = None  # vmmemWSL: the WSL2 guest's own memory view (wslhost.guest_memory)
     error: str | None = None
     elapsed: float = 0.0
 
@@ -133,4 +143,6 @@ CAT_SHM = "Shared memory"
 CAT_HEAP = "Private (heap/anon)"
 CAT_STACK = "Stacks"
 CAT_OTHER = "Other"
-CATEGORY_ORDER = [CAT_HEAP, CAT_STACK, CAT_IMAGE, CAT_MAPPED, CAT_SHM, CAT_OTHER]
+CAT_GPU = "Graphics / GPU"  # macOS: IOKit, IOSurface, IOAccelerator, CoreAnimation, CoreGraphics
+CAT_JIT = "JIT / JavaScript"  # macOS: JavaScriptCore heap and JIT code
+CATEGORY_ORDER = [CAT_HEAP, CAT_JIT, CAT_GPU, CAT_STACK, CAT_IMAGE, CAT_MAPPED, CAT_SHM, CAT_OTHER]

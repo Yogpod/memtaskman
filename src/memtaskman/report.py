@@ -35,6 +35,12 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Faults   {fmt_count_rate(sm.page_faults_ps)}/s, hard {fmt_count_rate(sm.hard_faults_ps)}/s")
     for k, v in sm.extra.items():
         lines.append(f"         {k}: {fmt_bytes(v)}")
+    if sm.pressure_level:
+        lines.append(f"Pressure {sm.pressure_level}")
+    if sm.pressure_some is not None:
+        lines.append(f"Pressure some {sm.pressure_some:.1f}%, full {sm.pressure_full or 0:.1f}% (PSI avg10)")
+    if sm.vm_note:
+        lines.append(f"Note     {sm.vm_note}")
     return lines
 
 
@@ -47,12 +53,15 @@ def render_text(snap: Snapshot, *, top: int | None = 25) -> str:
     if top:
         procs = procs[:top]
     pl = snap.private_label
-    has_pss = any(p.pss is not None for p in procs)
-    pss_h = f" {'PSS':>9}" if has_pss else ""
+    from memtaskman.collector import unique_column
+
+    uniq = unique_column()
+    has_pss = uniq is not None and any(getattr(p, uniq[1]) is not None for p in procs)
+    pss_h = f" {uniq[0]:>9}" if has_pss else ""
     out.append(f"{'PID':>7}  {'Name':<28} {'Resident':>9}{pss_h} {pl:>9} {'Growth':>10} {'Faults/s':>8}  Runtime")
     for p in procs:
         rt = f"{p.runtime or ''} {p.runtime_detail or ''}".strip()
-        pss = f" {fmt_bytes(p.pss):>9}" if has_pss else ""
+        pss = f" {fmt_bytes(getattr(p, uniq[1])):>9}" if has_pss else ""
         out.append(
             f"{p.pid:>7}  {p.name[:28]:<28} {fmt_bytes(p.resident):>9}{pss} {fmt_bytes(p.private):>9} "
             f"{fmt_rate(p.growth_ps):>10} {fmt_count_rate(p.faults_ps):>8}  {rt}"
@@ -70,6 +79,13 @@ def render_inspection(ins: Inspection) -> str:
             out.append(f"  {c.name:<22} {fmt_bytes(c.mapped):>9} {fmt_bytes(c.resident):>9} {fmt_bytes(c.resident_shared):>9}")
         if ins.reserved:
             out.append(f"  {'Reserved (uncommitted)':<22} {fmt_bytes(ins.reserved):>9}")
+    if ins.guest:
+        g = ins.guest
+        out.append(f"  Inside the WSL2 VM ({g['distro']}):")
+        for label, key in (("used by Linux", "used"), ("anonymous", "anon"), ("page cache", "cache"),
+                           ("tmpfs", "shmem"), ("free", "free"), ("VM size", "total")):
+            if g.get(key) is not None:
+                out.append(f"    {label:<14} {fmt_bytes(g[key]):>9}")
     if ins.top_files:
         out.append("  Top files:")
         for f in ins.top_files:

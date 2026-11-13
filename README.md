@@ -12,8 +12,9 @@ modified pages, the compression store, kernel pools and commit charge.
 
 Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does the same for VRAM.
 
-> Early, experimental software. Windows is the primary target, Linux is supported (tested on Ubuntu under WSL2), macOS
-> gets the basic psutil view without the address-space inspector.
+> Early, experimental software. Windows is the primary target, Linux is supported (tested on Ubuntu under WSL2).
+> macOS support (footprint, compression, memory pressure, and a vmmap-style inspector) is new and
+> **not yet validated on a real Mac**; it's checked by CI on Apple silicon runners.
 
 ## What you get
 
@@ -26,10 +27,34 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
 - **Process table**: resident (working set / RSS), private commit (Windows) or anonymous
   resident (Linux), a smoothed **growth rate** (a steadily positive number is what a leak
   looks like), page faults/s, kernel pool or swap, and the identified **runtime**.
+  On Windows a **PrivWS** column shows the private working set, which is Task Manager's "Memory"
+  number, for every process from a single PDH query.
   On Linux there is also a **PSS** column (resident memory with shared pages split fairly
   between the processes sharing them, so the column sums to real RAM use), read from
   `smaps_rollup` for the visible rows only. Other users' processes show `-` unless you run as root.
+- **Leak watch**: rows marked **▲** have private bytes that rose in a straight line (least-squares
+  R² ≥ 0.85, at least 16 MiB and 5%) over at least 2 of the last 10 minutes. Garbage-collector
+  sawtooth patterns aren't flagged. For hours-long hunts, `mtm record` then `mtm summary`.
+- **What's inside `vmmemWSL`** (Windows): select the `vmmemWSL` row (or `mtm inspect <pid>`) to see
+  the WSL2 guest's own view: used, page cache, tmpfs and free, versus what Windows holds for
+  the VM, plus `.wslconfig` limit and reclaim hints. It's read on demand and only when a distro
+  is already running, because polling would keep WSL from shutting down when idle. Disable it
+  with `--no-host`. Inside WSL, the Linux view notes that its RAM is really `vmmemWSL` on the host.
+- **macOS**: an Activity Monitor-style RAM bar (App / Wired / Compressed / Cached files / Free),
+  memory pressure level (normal / warn / critical), a **Footprint** column (Activity Monitor's
+  "Memory", which includes compressed memory and, on Apple silicon, GPU memory), and an inspector
+  that walks regions like `vmmap`. It splits malloc heaps, stacks, **Graphics / GPU** (IOKit,
+  IOSurface, IOAccelerator, CoreAnimation), **JIT / JavaScript**, dylibs plus the dyld shared
+  cache (counted once), and mapped files.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
+- **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
+  session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
+  counted once), with anon / file / shmem / kernel breakdown, `memory.max` limits, OOM kills and
+  per-cgroup memory pressure in the inspector.
+- **Memory pressure** (Linux PSI): the percentage of time tasks stalled waiting for memory,
+  shown in the status line and as a chart. It's a better out-of-memory signal than "% used".
+- **Standby by priority** (Windows): the standby cache split into reserve, normal and core,
+  in the order Windows reuses them.
 - **Inspector** for the selected process, built from a page-level walk of its address space:
 
   | Category            | Meaning                                                           |
@@ -79,7 +104,7 @@ and services; otherwise those show "access denied" in the inspector but still ap
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
 | `s`        | cycle sort: resident, PSS (Linux), private, growth, faults, name, pid |
-| `g`        | group processes by executable            |
+| `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
 | `a`        | top 50 / all processes                   |
 | `c`        | cycle charts (all, or one metric)        |
 | `m`        | slim mode (table only)                   |
@@ -95,10 +120,16 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
 mtm inspect PID [--json]    address-space breakdown of one process
-mtm record out.jsonl [-i 5] [-n COUNT] [--all]   append snapshots (JSON Lines)
+mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all]   append snapshots (JSON Lines)
+mtm summary out.jsonl [--top N] [--json]   steadily growing processes in a recording (leak finder)
 mtm diff a.json b.json      what grew, appeared or went away between snapshots
 ```
+
+Recording size: about 19 KB per snapshot with the default `--top 50` (~14 MB/hour at the default
+5 s interval) and about 120 KB with `--all` (~85 MB/hour). An interrupted recording can be
+appended to; a half-written last line is skipped when reading.
 
 Tip: take both snapshots with `--all` before using `diff`, otherwise processes outside the
 top N look like they appeared or vanished.
@@ -108,14 +139,21 @@ top N look like they appeared or vanished.
 | Source | Platform | Used for |
 |--------|----------|----------|
 | PDH `\Memory\*` counters | Windows | standby (3 priorities), modified, free+zero, cache, pools, fault rates |
+| PDH `\Process V2(*)\Working Set - Private` | Windows | private working set for every process (falls back to `\Process(*)`) |
 | `GetPerformanceInfo` | Windows | commit charge / limit / peak |
 | `GetProcessMemoryInfo` (via psutil) | Windows | working set, private commit, pools, fault counts |
 | `VirtualQueryEx` | Windows | every region: committed vs reserved, image / mapped / private, stacks (guard pages) |
 | `GetMappedFileName` | Windows | which file backs each image/mapped region |
 | `QueryWorkingSet` | Windows | every resident page and its shared bit, attributed back to regions |
 | `EnumProcessModulesEx` | Windows | loaded DLLs for runtime identification |
+| `host_statistics64(HOST_VM_INFO64)` | macOS | app / wired / compressed / cached / free pages, faults, page-ins |
+| `sysctl` `vm.pagesize`, `kern.memorystatus_vm_pressure_level` | macOS | page size (16 KB on Apple silicon), memory pressure |
+| `proc_pid_rusage(RUSAGE_INFO_V4)` | macOS | physical footprint and lifetime peak per process |
+| `proc_pidinfo(PROC_PIDTASKINFO / PROC_PIDREGIONPATHINFO)` | macOS | fault counts; per-region tag, share mode, resident / shared / swapped pages, backing file |
 | `/proc/meminfo`, `/proc/vmstat` | Linux | cache, dirty, slab, zswap, commit, fault rates |
 | `/proc/<pid>/status`, `stat` | Linux | RssAnon / RssFile / RssShmem, VmSwap, VmHWM, faults |
+| `/proc/pressure/memory` | Linux | memory pressure stall information (PSI) |
+| `/proc/<pid>/cgroup`, `/sys/fs/cgroup/**/memory.*` | Linux | cgroup membership, `memory.current`, `memory.stat`, limits, events, per-cgroup pressure (v2; v1 basic) |
 | `/proc/<pid>/smaps_rollup` | Linux | PSS and USS (private clean + dirty) for visible rows, refreshed every 2 s at most |
 | `/proc/<pid>/smaps`, `maps` | Linux | per-mapping Rss / Shared / Swap, loaded libraries |
 
