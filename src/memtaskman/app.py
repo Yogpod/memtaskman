@@ -20,7 +20,17 @@ from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app,
 
 UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
-from memtaskman.model import DERIVED, HINT, IDENTIFIED, MEASURED, Inspection, ProcessMem, Snapshot, SystemMemory
+from memtaskman.model import (
+    DERIVED,
+    FIELD_LABELS,
+    HINT,
+    IDENTIFIED,
+    MEASURED,
+    Inspection,
+    ProcessMem,
+    Snapshot,
+    SystemMemory,
+)
 
 HISTORY = 120
 TOP_N = 50
@@ -379,10 +389,16 @@ class MemTaskManApp(App):
             ("Compressed", sm.compressed, "compression store" if WINDOWS else "zswap pool"),
         ]
         rows += [(k, v, "") for k, v in sm.extra.items()]
+        why = [(FIELD_LABELS.get(k, k), r) for k, r in sm.unavailable.items() if k != "page_faults_ps"]
         for label, value, note in rows:
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
-        w.update(Group(Text("System", style="bold"), t, *([note] if note else [])))
+        extra = []
+        if why:
+            extra.append(Text("Unavailable", style="bold dim"))
+            for label, reason in why:
+                extra.append(Text(f"  {label}: {reason}", style="dim"))
+        w.update(Group(Text("System", style="bold"), t, *([note] if note else []), *extra))
 
     def _ordered(self, snap: Snapshot) -> list[ProcessMem]:
         if self.group_mode == "cgroup" and snap.cgroups is not None:
@@ -617,6 +633,11 @@ class MemTaskManApp(App):
                 line.append(f"{level:<11}", style=LEVEL_STYLE.get(level, ""))
                 line.append(text)
                 parts.append(line)
+        missing = {k: r for k, r in ins.unavailable.items() if k not in ("growth_ps", "faults_ps") or r != "needs two samples"}
+        if missing:
+            parts.append(Text("\nWhy some values show -", style="bold"))
+            for k, r in missing.items():
+                parts.append(Text(f"  {FIELD_LABELS.get(k, k)}: {r}", style="dim"))
         if ins.cmdline and not self.privacy:
             parts.append(Text("\n" + " ".join(ins.cmdline)[:300], style="dim"))
         parts.append(Text(f"\ninspected in {ins.elapsed * 1000:.0f} ms, refreshes every {INSPECT_EVERY:.0f}s", style="dim"))

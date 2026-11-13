@@ -40,6 +40,7 @@ class SystemMemory:
     pressure_level: str | None = None  # macOS: normal / warn / critical (kern.memorystatus_vm_pressure_level)
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
     vm_note: str | None = None  # e.g. "this is a WSL2 VM" when running inside one
+    unavailable: dict[str, str] = field(default_factory=dict)  # field -> why it is None
     source: str = "psutil"
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,6 +70,7 @@ class ProcessMem:
     leak: str | None = None  # description when growth has been steady for minutes (see leaks.py)
     cgroup: str | None = None  # Linux cgroup path (per process) or the group's path (cgroup rows)
     cgroup_stats: dict | None = None  # kernel accounting for cgroup rows (memory.current, stat, limits)
+    unavailable: dict[str, str] = field(default_factory=dict)  # field -> why it is None
 
     @property
     def key(self) -> tuple[int, float]:
@@ -129,12 +131,28 @@ class Inspection:
     evidence: list[tuple[str, str]] = field(default_factory=list)  # (level, text)
     cmdline: list[str] = field(default_factory=list)
     guest: dict | None = None  # vmmemWSL: the WSL2 guest's own memory view (wslhost.guest_memory)
+    unavailable: dict[str, str] = field(default_factory=dict)  # copied from the process row
     error: str | None = None
     elapsed: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+# Human labels for fields that can be unavailable (shown next to the reason).
+FIELD_LABELS = {
+    "private": "Private", "uss": "Private working set", "pss": "PSS", "growth_ps": "Growth",
+    "faults_ps": "Faults/s", "swapped": "Swap", "peak": "Peak",
+    "standby": "Standby", "modified": "Modified", "compressed": "Compressed", "commit_used": "Commit",
+    "pressure_some": "Memory pressure", "pressure_level": "Memory pressure", "page_faults_ps": "Page faults/s",
+    "kernel_paged": "Kernel pools", "swap_total": "Swap", "free": "Free", "cached": "Cache",
+}
+
+# Common reasons, kept short: they are shown in a narrow side panel.
+WHY_NEEDS_TWO = "needs two samples"
+WHY_OTHER_USER_LINUX = "another user's process: run with sudo"
+WHY_OTHER_USER_MAC = "another user's process: run with sudo"
+WHY_ACCESS = "access denied: run elevated"
 
 # Fixed category names so Windows and Linux line up in the UI.
 CAT_IMAGE = "Images (exe/dll/.so)"

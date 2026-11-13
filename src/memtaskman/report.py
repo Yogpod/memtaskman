@@ -39,6 +39,9 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Pressure {sm.pressure_level}")
     if sm.pressure_some is not None:
         lines.append(f"Pressure some {sm.pressure_some:.1f}%, full {sm.pressure_full or 0:.1f}% (PSI avg10)")
+    for k, r in sm.unavailable.items():
+        if k != "page_faults_ps":
+            lines.append(f"n/a      {k}: {r}")
     if sm.vm_note:
         lines.append(f"Note     {sm.vm_note}")
     return lines
@@ -92,6 +95,9 @@ def render_inspection(ins: Inspection) -> str:
             out.append(f"    {fmt_bytes(f.resident):>9} res {fmt_bytes(f.mapped):>9} map  {f.path}")
     for level, text in ins.evidence:
         out.append(f"  [{level}] {text}")
+    for k, r in ins.unavailable.items():
+        if r != "needs two samples":  # inspect takes one sample; rates are never expected there
+            out.append(f"  [unavailable] {k}: {r}")
     if ins.cmdline:
         out.append("  cmd: " + " ".join(ins.cmdline)[:400])
     return "\n".join(out)
