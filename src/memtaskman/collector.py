@@ -324,6 +324,8 @@ class Collector:
         comp = next((p for p in procs if p.name.lower() in ("memory compression", "memcompression")), None)
         if comp is not None:
             sm.compressed = comp.resident
+        sm.pagefiles = native.pagefiles()
+        sm.low_memory = native.low_memory()
         self._first = False
 
     def _system_macos(self, sm: SystemMemory, now: float) -> None:

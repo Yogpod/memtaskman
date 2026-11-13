@@ -108,6 +108,74 @@ kernel32.K32GetPerformanceInfo.restype = wt.BOOL
 kernel32.K32GetPerformanceInfo.argtypes = [ctypes.POINTER(PERFORMANCE_INFORMATION), wt.DWORD]
 
 
+ntdll = ctypes.WinDLL("ntdll")
+ntdll.NtQuerySystemInformation.restype = ctypes.c_long
+ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_ulong)]
+SystemPageFileInformation = 18
+STATUS_INFO_LENGTH_MISMATCH = ctypes.c_long(0xC0000004).value
+
+
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", wt.USHORT), ("MaximumLength", wt.USHORT), ("Buffer", ctypes.c_void_p)]
+
+
+class SYSTEM_PAGEFILE_INFORMATION(ctypes.Structure):
+    _fields_ = [("NextEntryOffset", wt.ULONG), ("TotalSize", wt.ULONG), ("TotalInUse", wt.ULONG),
+                ("PeakUsage", wt.ULONG), ("PageFileName", UNICODE_STRING)]
+
+
+def pagefiles() -> list[dict] | None:
+    """Every pagefile: path, size, in use and peak (bytes). None when the query is refused."""
+    size = 4096
+    for _ in range(4):
+        buf = ctypes.create_string_buffer(size)
+        ret = ctypes.c_ulong(0)
+        status = ntdll.NtQuerySystemInformation(SystemPageFileInformation, buf, size, ctypes.byref(ret))
+        if status == STATUS_INFO_LENGTH_MISMATCH:
+            size = max(size * 2, ret.value + 256)
+            continue
+        if status != 0:
+            return None
+        break
+    else:
+        return None
+    out, offset = [], 0
+    if ret.value == 0:
+        return []  # no pagefile configured
+    base = ctypes.addressof(buf)
+    while True:
+        info = SYSTEM_PAGEFILE_INFORMATION.from_address(base + offset)
+        name = ctypes.wstring_at(info.PageFileName.Buffer, info.PageFileName.Length // 2) if info.PageFileName.Buffer else ""
+        if name.startswith("\\??\\"):
+            name = name[4:]
+        out.append({"path": name, "size": info.TotalSize * PAGE_SIZE, "used": info.TotalInUse * PAGE_SIZE,
+                    "peak": info.PeakUsage * PAGE_SIZE})
+        if not info.NextEntryOffset:
+            break
+        offset += info.NextEntryOffset
+    return out
+
+
+kernel32.CreateMemoryResourceNotification.restype = wt.HANDLE
+kernel32.CreateMemoryResourceNotification.argtypes = [ctypes.c_int]
+kernel32.QueryMemoryResourceNotification.restype = wt.BOOL
+kernel32.QueryMemoryResourceNotification.argtypes = [wt.HANDLE, ctypes.POINTER(wt.BOOL)]
+_low_memory_handle = None
+
+
+def low_memory() -> bool | None:
+    """Windows' own low-physical-memory signal (the one apps use to drop caches)."""
+    global _low_memory_handle
+    if _low_memory_handle is None:
+        _low_memory_handle = kernel32.CreateMemoryResourceNotification(0) or 0  # LowMemoryResourceNotification
+    if not _low_memory_handle:
+        return None
+    state = wt.BOOL()
+    if not kernel32.QueryMemoryResourceNotification(_low_memory_handle, ctypes.byref(state)):
+        return None
+    return bool(state.value)
+
+
 def performance_info() -> dict[str, int] | None:
     pi = PERFORMANCE_INFORMATION()
     pi.cb = ctypes.sizeof(pi)

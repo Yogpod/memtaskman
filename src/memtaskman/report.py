@@ -35,6 +35,13 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Faults   {fmt_count_rate(sm.page_faults_ps)}/s, hard {fmt_count_rate(sm.hard_faults_ps)}/s")
     for k, v in sm.extra.items():
         lines.append(f"         {k}: {fmt_bytes(v)}")
+    for pf in sm.pagefiles or []:
+        lines.append(f"Pagefile {pf['path']}: {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, "
+                     f"peak {fmt_bytes(pf['peak'])}")
+    if sm.low_memory:
+        lines.append("LOW MEMORY (Windows LowMemoryResourceNotification is signalled)")
+    if sm.commit_used and sm.commit_limit and sm.commit_used >= 0.9 * sm.commit_limit:
+        lines.append(f"WARNING  commit charge at {100 * sm.commit_used / sm.commit_limit:.0f}% of the limit")
     if sm.pressure_level:
         lines.append(f"Pressure {sm.pressure_level}")
     if sm.pressure_some is not None:

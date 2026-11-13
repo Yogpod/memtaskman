@@ -38,6 +38,8 @@ class SystemMemory:
     pressure_some: float | None = None  # Linux PSI: % of time some task stalled on memory (avg10)
     pressure_full: float | None = None  # Linux PSI: % of time all tasks stalled on memory (avg10)
     pressure_level: str | None = None  # macOS: normal / warn / critical (kern.memorystatus_vm_pressure_level)
+    low_memory: bool | None = None  # Windows: LowMemoryResourceNotification is signalled
+    pagefiles: list[dict] | None = None  # Windows: [{path, size, used, peak}] per pagefile
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
     vm_note: str | None = None  # e.g. "this is a WSL2 VM" when running inside one
     unavailable: dict[str, str] = field(default_factory=dict)  # field -> why it is None

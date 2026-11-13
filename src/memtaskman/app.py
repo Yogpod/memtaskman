@@ -91,6 +91,7 @@ HELP = f"""\
   [{C_STANDBY}]■ Standby/cache[/]  file cache; instantly reusable, so it is "available"
   [{C_FREE}]■ Free[/]       zeroed / free pages (Linux: MemFree)
   Commit      memory promised to processes (RAM + pagefile); hitting the limit = out of memory
+              (status line warns above 90%; LOW MEMORY = Windows' own low-memory signal)
   Compressed  Windows compression store / Linux zswap pool
 
 [b]Process columns[/b]
@@ -487,6 +488,10 @@ class MemTaskManApp(App):
             full = sm0.pressure_full or 0.0
             style = "bold red" if full >= 5 else "yellow" if sm0.pressure_some >= 5 else "dim"
             status.append(f"  pressure some {sm0.pressure_some:.1f}% full {full:.1f}%", style=style)
+        if sm0 and sm0.low_memory:
+            status.append("  LOW MEMORY", style="bold red")
+        if sm0 and sm0.commit_used and sm0.commit_limit and sm0.commit_used >= 0.9 * sm0.commit_limit:
+            status.append(f"  commit {100 * sm0.commit_used / sm0.commit_limit:.0f}% of limit", style="bold red")
         if sm0 and sm0.pressure_level:
             style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
             status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
@@ -570,6 +575,12 @@ class MemTaskManApp(App):
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
         extra = []
+        for pf in sm.pagefiles or []:
+            line = Text(f"Pagefile {pf['path']}", style="dim")
+            line.append(f"  {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, peak {fmt_bytes(pf['peak'])}")
+            extra.append(line)
+        if sm.pagefiles == []:
+            extra.append(Text("No pagefile: commit limit = RAM", style="yellow"))
         if why:
             extra.append(Text("Unavailable", style="bold dim"))
             for label, reason in why:
