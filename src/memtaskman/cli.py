@@ -108,7 +108,7 @@ def cmd_record(args) -> int:
                 if not args.all:
                     snap.truncated = len(snap.processes) > args.top
                     snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
-                f.write(json.dumps(snap.to_dict(), separators=(",", ":")) + "\n")
+                f.write(json.dumps(snap.to_dict(compact=args.compact), separators=(",", ":")) + "\n")
                 f.flush()
                 n += 1
                 print(f"\rrecorded {n} snapshot(s) to {args.out}", end="", file=sys.stderr)
@@ -208,6 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--all", action="store_true")
     r.add_argument("--no-system", action="store_true")
     r.add_argument("--filter", metavar="TEXT", help="only record matching processes")
+    r.add_argument("--compact", action="store_true",
+                   help="store only the fields diff/summary use (about 2.5x smaller)")
     r.set_defaults(func=cmd_record)
 
     sm = sub.add_parser("summary", help="find steadily growing processes in a `record` file")

@@ -84,6 +84,21 @@ class RecordingTests(unittest.TestCase):
         self.assertEqual(sum(1 for r in rows if r.trend and r.trend.is_leak), 1)
         self.assertEqual({r.name for r in rows if r.pid == 20}, {"first", "second"})
 
+    def test_compact_snapshot_still_summarizes(self):
+        from memtaskman.model import ProcessMem, Snapshot
+
+        lines = []
+        for i in range(30):
+            p = ProcessMem(pid=9, name="grow", ppid=1, create_time=5.0, resident=M, private=50 * M + i * 5 * 300 * 1024)
+            p.unavailable["pss"] = "x"
+            lines.append(json.dumps(Snapshot(i * 5.0, "test", None, [p]).to_dict(compact=True)))
+        snaps, skipped = read_jsonl(self._write(lines))
+        self.assertEqual(skipped, 0)
+        self.assertNotIn("unavailable", snaps[0]["processes"][0])
+        self.assertNotIn("ppid", snaps[0]["processes"][0])
+        rows = list(rank(summarize(snaps)))
+        self.assertTrue(rows[0].trend.is_leak)
+
     def test_parse_duration(self):
         self.assertEqual(parse_duration("90"), 90)
         self.assertEqual(parse_duration("90s"), 90)

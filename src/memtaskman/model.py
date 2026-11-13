@@ -90,7 +90,9 @@ class Snapshot:
     cgroups: list[ProcessMem] | None = None  # Linux: one row per cgroup, from kernel accounting
     truncated: bool = False  # processes were limited to the top N (diff reports "not listed")
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, compact: bool = False) -> dict[str, Any]:
+        if compact:
+            return self.to_compact_dict()
         return {
             "version": 1,
             "time": self.time,
@@ -100,6 +102,27 @@ class Snapshot:
             "system": self.system.to_dict() if self.system else None,
             "processes": [p.to_dict() for p in self.processes],
             "cgroups": [g.to_dict() for g in self.cgroups] if self.cgroups is not None else None,
+        }
+
+    def to_compact_dict(self) -> dict[str, Any]:
+        """Smaller form for long recordings: only the fields diff/summary use, no empty values."""
+        def slim(d: dict, keep: tuple[str, ...]) -> dict:
+            out = {}
+            for k in keep:
+                v = d.get(k)
+                if v is None or v == {} or v == []:
+                    continue
+                out[k] = round(v, 1) if isinstance(v, float) else v
+            return out
+
+        return {
+            "version": 1,
+            "compact": True,
+            "time": round(self.time, 3),
+            "platform": self.platform,
+            "truncated": self.truncated,
+            "system": slim(self.system.to_dict(), COMPACT_SYSTEM) if self.system else None,
+            "processes": [slim(p.to_dict(), COMPACT_PROCESS) for p in self.processes],
         }
 
 
@@ -140,6 +163,12 @@ class Inspection:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+
+COMPACT_PROCESS = ("pid", "name", "create_time", "resident", "private", "uss", "pss", "swapped",
+                   "growth_ps", "faults_ps", "runtime", "runtime_detail", "leak")
+COMPACT_SYSTEM = ("total", "available", "used", "standby", "modified", "cached", "compressed", "commit_used",
+                  "commit_limit", "swap_used", "kernel_paged", "kernel_nonpaged", "page_faults_ps", "hard_faults_ps",
+                  "pressure_some", "pressure_full", "pressure_level")
 
 # Human labels for fields that can be unavailable (shown next to the reason).
 FIELD_LABELS = {
