@@ -16,6 +16,28 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
 > macOS support (footprint, compression, memory pressure, and a vmmap-style inspector) is new and
 > **not yet validated on a real Mac**; it's checked by CI on Apple silicon runners.
 
+![memtaskman dashboard: RAM, commit and swap bars, eight history charts, the process table and the inspector breaking a Steam web helper process into heap, stacks, DLLs and mapped files](docs/screenshots/dashboard.svg)
+
+<details>
+<summary>More screenshots: grouped by app, slim mode, help</summary>
+
+**Grouped by app** (`g`): every process of the same executable summed into one row.
+
+![Processes grouped by executable, with process counts](docs/screenshots/grouped.svg)
+
+**Slim mode** (`m`): just the bars and the table.
+
+![Slim mode showing only the memory bars and process table](docs/screenshots/slim.svg)
+
+**Help** (`?`): what every counter means.
+
+![Help screen explaining each counter](docs/screenshots/help.svg)
+
+</details>
+
+Screenshots are captured with `tools/capture_screenshots.py` in privacy mode: no command lines, and
+home directories are shown as `~`.
+
 ## What you get
 
 - **System bar**: RAM split into *In use / Modified / Standby / Free* (Windows) or
@@ -46,6 +68,10 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
   that walks regions like `vmmap`. It splits malloc heaps, stacks, **Graphics / GPU** (IOKit,
   IOSurface, IOAccelerator, CoreAnimation), **JIT / JavaScript**, dylibs plus the dyld shared
   cache (counted once), and mapped files.
+- **AI models in RAM**: memory-mapped GGUF files (llama.cpp, Ollama, LM Studio) are named from
+  their header, e.g. `Qwen3 14B Q4_K_M: 3.9G of 8.6G resident (45%)`. Only the header is read,
+  never the weights. Inspecting an Ollama process asks its local API (`GET /api/ps`, localhost
+  only, 0.5 s timeout) how each loaded model is split between RAM and VRAM.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
 - **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
@@ -84,25 +110,46 @@ hosts (`vmmem`/`vmmemWSL`, QEMU, VMware, VirtualBox) and the Windows compression
 
 ## Install & run
 
-```bash
-uv tool install .         # from a clone; or: pipx install .
-memtaskman                # or: mtm
-```
-
-Without installing:
+**From PyPI** (Python 3.11+):
 
 ```bash
-uv run mtm
+uv tool install memtaskman    # or: pipx install memtaskman
+mtm                           # or: memtaskman
 ```
 
-Run from an elevated terminal (or as root on Linux) to inspect processes owned by other users
-and services; otherwise those show "access denied" in the inspector but still appear in the table.
+**Portable, no Python needed:** download the zip (Windows x64 / ARM64) or tar.gz (Linux x64 /
+ARM64, glibc 2.35+) from the [latest release](https://github.com/Yogpod/memtaskman/releases/latest),
+extract it, and run `mtm` inside. Keep the `_internal` folder next to it. Each archive has a
+`.sha256` checksum; the builds are unsigned, so Windows SmartScreen may ask once.
+
+**From a clone:**
+
+```bash
+uv run mtm                # or: uv tool install .
+```
+
+The layout adapts to the terminal: below 150 columns the system panel and inspector move under
+the table, less important columns are dropped as space runs out, and charts are hidden below 36
+rows. It's usable down to 80×24; the full view wants about 190 columns.
+
+### Permissions
+
+memtaskman works without admin rights. Other users' and services' processes still appear in the
+table, but some of their values show `-`, and the inspector explains why. For the full picture:
+
+- **Windows:** run from an elevated terminal. Protected processes (anti-malware, `System`) stay
+  partly hidden even then.
+- **Linux:** run with `sudo` for other users' PSS, `smaps` and `/proc/slabinfo`.
+- **macOS:** run with `sudo` for other users' footprint and region walk. System Integrity
+  Protection still blocks some Apple system processes even as root; memtaskman never asks for
+  debugger permissions (`task_for_pid`).
 
 ## Keys
 
 | Key        | Action                                   |
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
+| `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
 | `s`        | cycle sort: resident, PSS (Linux), private, growth, faults, name, pid |
 | `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
 | `a`        | top 50 / all processes                   |
@@ -120,19 +167,25 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --once --filter brave   only processes matching a name, runtime or PID (also --json, record)
 mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
 mtm inspect PID [--json]    address-space breakdown of one process
-mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all]   append snapshots (JSON Lines)
+mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all] [--compact]   append snapshots (JSON Lines)
 mtm summary out.jsonl [--top N] [--json]   steadily growing processes in a recording (leak finder)
-mtm diff a.json b.json      what grew, appeared or went away between snapshots
+mtm diff a.json b.json [--json] [--threshold 16m] [--by-name]   what grew, restarted, appeared or went away
 ```
 
 Recording size: about 19 KB per snapshot with the default `--top 50` (~14 MB/hour at the default
 5 s interval) and about 120 KB with `--all` (~85 MB/hour). An interrupted recording can be
-appended to; a half-written last line is skipped when reading.
+appended to; a half-written last line is skipped when reading. `--compact` keeps only the fields
+`diff` and `summary` use: about 8 KB per snapshot (~6 MB/hour), or about 48 KB with `--all`.
+
+`diff` pairs processes by PID *and* start time (a reused PID is a different process), pairs
+a unique name that came back under a new PID as `restarted`, and hides changes under 16 MiB
+in text output (`--json` keeps everything).
 
 Tip: take both snapshots with `--all` before using `diff`, otherwise processes outside the
-top N look like they appeared or vanished.
+top N can only be reported as `not listed`.
 
 ## How it measures
 
@@ -168,6 +221,33 @@ Caveats:
 - The compression store is reported as the working set of the `MemCompression` process.
 - The inspector walk takes ~0.1-1 s for very large processes; it runs in the background and
   refreshes every 5 seconds.
+- macOS *Footprint* includes compressed memory and, on Apple silicon, GPU allocations, so it
+  can exceed *Resident*. That is intended: it's what Activity Monitor calls Memory.
+
+## Privacy
+
+- memtaskman reads memory **metadata** (sizes, page states, mapped file names), never the
+  contents of another process's memory. Model files are read up to their GGUF header only.
+- No telemetry. The only network request is an optional `GET /api/ps` to an Ollama server on
+  localhost, made only while you inspect an Ollama process.
+- `--json`, `record` and `inspect` output contain process names, command lines, file paths
+  (including your home directory) and model names. **Redact before sharing.**
+- `--privacy` hides command lines and shows home directories as `~` in the interface, for
+  screenshots and screen sharing. Process names stay visible.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Many `-` values for other users' processes | Expected without admin/root; the inspector says why. Run elevated / with `sudo`. |
+| Inspector says "access denied" | Same as above; protected Windows processes stay hidden even when elevated. |
+| No PSS column values on Linux | PSS is read for visible rows only, every 2 s; other users' rows need `sudo`. |
+| Standby/modified missing on Windows | PDH counters disabled or corrupted: `lodctr /r` from an elevated prompt. |
+| Memory pressure shows `-` on Linux | Kernel without PSI (`CONFIG_PSI`), or booted with `psi=0`. |
+| `vmmemWSL` inspector has no guest view | No distro is running (memtaskman never starts WSL), or `--no-host` was given. |
+| Leak marker never appears | It needs at least 2 minutes of steady growth of 16 MiB and 5%; use `record` + `summary` for slow leaks. |
+| Layout cramped or columns missing | Columns are dropped as width shrinks; the full view wants ~190 columns, or press `m` for slim mode. |
+| Ollama model split not shown | Ollama's API isn't on localhost (`OLLAMA_HOST`), or the server isn't running. |
 
 ## Development
 
@@ -176,6 +256,7 @@ uv sync
 uv run python -m unittest discover -s tests -v   # hardware-independent unit tests
 uv run python tools/smoke.py                      # live check: counters, inspector, TUI, every CLI command
 uv build
+uv run --with pyinstaller python tools/build_portable.py   # portable bundle for this OS/CPU
 ```
 
 CI (`.github/workflows/ci.yml`) runs the unit tests and the smoke test on Windows, Linux and
@@ -189,17 +270,23 @@ Layout:
 ```
 src/memtaskman/
   app.py        Textual TUI
-  cli.py        argument parsing, --once / --json / inspect / record / diff
-  collector.py  sampling, growth & fault rates, runtime cache, group-by-app
-  win32.py      ctypes: PDH, GetPerformanceInfo, VirtualQueryEx, QueryWorkingSet, modules
-  linux.py      /proc parsers (pure) and readers
+  cli.py        argument parsing, --once / --json / inspect / record / summary / diff
+  collector.py  sampling, rates, leak series, runtime cache, cgroups, unavailable reasons
+  win32.py      Windows ctypes: PDH, GetPerformanceInfo, VirtualQueryEx, QueryWorkingSet, modules
+  linux.py      /proc and cgroup parsers (pure) and readers
+  macos.py      macOS ctypes: host_statistics64, proc_pid_rusage, region walk
+  wslhost.py    the WSL2 guest's view of vmmemWSL, on demand
+  models.py     GGUF header parser, Ollama /api/ps
   runtime.py    runtime identification from modules + command line (pure)
+  leaks.py      trend fitting, leak rule, recording summary (pure)
+  diff.py       snapshot comparison (pure)
   model.py      dataclasses shared by everything
   report.py     text / JSON output
-  diff.py       snapshot comparison
-  fmt.py        byte & rate formatting
+  fmt.py        byte & rate formatting, redaction
 tests/          hardware-independent unit tests
-tools/smoke.py  end-to-end check against the live machine (used by CI)
+tools/          smoke.py (live end-to-end check, used by CI), capture_screenshots.py
+
+See AGENTS.md for the evidence rules every change must follow, and CONTRIBUTING.md.
 ```
 
 ## License

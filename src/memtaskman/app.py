@@ -13,16 +13,34 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Sparkline, Static
+from textual.widgets import DataTable, Footer, Input, Sparkline, Static
 
-from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, sort_procs, unique_column
+from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, matches, sort_procs, unique_column
 
 UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
-from memtaskman.model import DERIVED, HINT, IDENTIFIED, MEASURED, Inspection, ProcessMem, Snapshot, SystemMemory
+from memtaskman.model import (
+    DERIVED,
+    FIELD_LABELS,
+    HINT,
+    IDENTIFIED,
+    MEASURED,
+    Inspection,
+    ProcessMem,
+    Snapshot,
+    SystemMemory,
+)
 
 HISTORY = 120
+SIDE_W = 65  # side panel width incl. border
+NARROW_W = 150  # below this the side panel moves under the table
+# Column tiers chosen from the width left for the table (cells include 2 columns of padding):
+FULL_COLS_W = 128  # tier 0: all columns
+MID_COLS_W = 104  # tier 1: drop Faults/s and Pool/Swap, shorter Runtime
+SMALL_COLS_W = 92  # tier 2: also shorter Name and Runtime; below (tier 3): also drop PSS/PrivWS
+SHORT_H = 36  # below this the charts are hidden
 TOP_N = 50
 INSPECT_EVERY = 5.0
 
@@ -75,7 +93,14 @@ HELP = f"""\
               over at least 2 minutes of the last 10. GC sawtooth patterns are not flagged.
               For long runs: mtm record out.jsonl, then mtm summary out.jsonl
   Faults/s    page faults per second (soft + hard)
+  Footprint   macOS: Activity Monitor's "Memory". Private memory incl. compressed pages and,
+              on Apple silicon, GPU allocations, so it can exceed Resident
   Pool/Swap   Windows: kernel pool charged to the process / Linux: swapped-out bytes
+
+[b]macOS system bar[/b] App (anonymous) / Wired (kernel, can't be paged or compressed) /
+  Compressed (compressor pool) / Cached files (reclaimable) / Free.
+  Memory pressure normal / warn / critical is the kernel's own verdict, the same as
+  Activity Monitor's pressure graph.
 
 [b]Inspector[/b] walks the selected process's address space:
   Images      exe/DLL/.so code+data, mostly shared with other processes
@@ -94,8 +119,30 @@ HELP = f"""\
 [b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
   waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
 
-[b]Keys[/b]  ↑/↓ select  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Keys[/b]  ↑/↓ select  / filter  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
+
+
+def ui_callback(method):
+    """For updates posted from worker threads: skip them once the app is shutting down.
+
+    A sample or inspection can finish just after the user quits; its widgets are gone by
+    then, and drawing into them must not turn a clean exit into a traceback.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._shutting_down:
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except NoMatches:
+            if self._shutting_down or not self.is_running or not self.query("#procs"):
+                return None  # widgets already torn down: the app is exiting
+            raise
+
+    return wrapper
 
 
 class HelpScreen(ModalScreen):
@@ -141,6 +188,7 @@ def ram_segments(sm: SystemMemory) -> list[tuple[str, int, str]]:
 
 class MemTaskManApp(App):
     TITLE = "memtaskman"
+    AUTO_FOCUS = "#procs"  # never the (hidden) filter input, or it would swallow every key
     CSS = """
     Screen { layout: vertical; }
     #top { height: auto; padding: 0 1; }
@@ -156,6 +204,13 @@ class MemTaskManApp(App):
     #system { height: auto; padding: 0 1; }
     #inspector { height: 1fr; padding: 0 1; }
     .slim #charts, .slim #side { display: none; }
+    .narrow #body { layout: vertical; }
+    .narrow #procs { height: 1fr; }
+    .narrow #side { width: 1fr; height: 45%; border-left: none; border-top: tall $panel; }
+    .narrow #charts { grid-size: 2 4; height: 16; }
+    .short #charts { display: none; }
+    #filter { display: none; height: 3; margin: 0 1; }
+    #filter.visible { display: block; }
     HelpScreen { align: center middle; }
     #help { width: 100; max-width: 95%; height: 80%; border: round $accent; background: $surface; padding: 1 2; }
     """
@@ -167,7 +222,9 @@ class MemTaskManApp(App):
         Binding("c", "charts", "Charts"),
         Binding("m", "mode", "Slim"),
         Binding("p", "pause", "Pause"),
+        Binding("slash", "filter", "Filter", key_display="/"),
         Binding("question_mark", "help", "Help", key_display="?"),
+        Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
 
     def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
@@ -181,6 +238,8 @@ class MemTaskManApp(App):
         self.sort_key = "resident"
         self.show_all = False
         self.group_mode = "none"  # none | app | cgroup (Linux)
+        self.filter_text = ""
+        self.compact_cols = 0  # column tier, see _column_tier
         self.paused = False
         self.chart_mode = -1  # -1 = all charts, else index into CHARTS
         self.snapshot: Snapshot | None = None
@@ -188,6 +247,7 @@ class MemTaskManApp(App):
         self.selected: str | None = None
         self.last_inspect = 0.0
         self.inspection: Inspection | None = None
+        self._shutting_down = False
 
     # ------------------------------------------------------------------ layout
     @property
@@ -207,12 +267,36 @@ class MemTaskManApp(App):
                 yield Static(id="system")
                 with VerticalScroll(id="inspector"):
                     yield Static("Select a process to see what its memory is made of.", id="inspect-body")
+        yield Input(placeholder="filter by name, runtime or PID   (Enter keeps it, Esc clears)", id="filter")
         yield Footer()
 
+    def on_resize(self, event) -> None:
+        self._apply_size(event.size.width, event.size.height)
+
+    def _column_tier(self, width: int) -> int:
+        slim = self.screen.has_class("slim")
+        narrow = width < NARROW_W
+        table_w = width if (slim or narrow) else width - SIDE_W
+        if table_w >= FULL_COLS_W:
+            return 0
+        return 1 if table_w >= MID_COLS_W else 2 if table_w >= SMALL_COLS_W else 3
+
+    def _apply_size(self, width: int, height: int) -> None:
+        self.screen.set_class(width < NARROW_W, "narrow")
+        self.screen.set_class(height < SHORT_H, "short")
+        compact = self._column_tier(width)
+        if compact != self.compact_cols:
+            self.compact_cols = compact
+            self._setup_columns()
+            if self.snapshot:
+                self.render_table()
+
     def on_mount(self) -> None:
+        self.compact_cols = self._column_tier(self.size.width)
+        self._apply_size(self.size.width, self.size.height)
         self._setup_columns()
         self.set_interval(self.interval, self.tick)
-        self.tick()
+        self.call_after_refresh(self.tick)  # first sample once the widgets are on screen
 
     def _setup_columns(self) -> None:
         t = self.query_one("#procs", DataTable)
@@ -221,15 +305,16 @@ class MemTaskManApp(App):
         last = "Pool" if WINDOWS else "Swap"
         first = "Procs" if self.grouped else "PID"
         t.add_column(first, key="pid", width=7)
-        t.add_column("Name", key="name", width=26)
+        t.add_column("Name", key="name", width=18 if self.compact_cols >= 2 else 26)
         t.add_column("Resident", key="resident", width=9)
-        if UNIQUE:
+        if UNIQUE and self.compact_cols < 3:
             t.add_column(UNIQUE[0], key=UNIQUE[1], width=9)
         t.add_column(pl, key="private", width=9)
         t.add_column("Growth", key="growth", width=10)
-        t.add_column("Faults/s", key="faults", width=8)
-        t.add_column(last, key="extra", width=7)
-        t.add_column("Runtime", key="runtime", width=24)
+        if not self.compact_cols:
+            t.add_column("Faults/s", key="faults", width=8)
+            t.add_column(last, key="extra", width=7)
+        t.add_column("Runtime", key="runtime", width=(24, 18, 14, 14)[self.compact_cols])
 
     def collector_private_label(self) -> str:
         from memtaskman.collector import private_label
@@ -251,6 +336,7 @@ class MemTaskManApp(App):
         self.collector.refresh_pss(visible, time_budget=0.2)
         self.call_from_thread(self.apply, snap)
 
+    @ui_callback
     def apply(self, snap: Snapshot) -> None:
         self.snapshot = snap
         if snap.system:
@@ -298,6 +384,8 @@ class MemTaskManApp(App):
         if sm0 and sm0.pressure_level:
             style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
             status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
+        if self.filter_text:
+            status.append(f'  filter "{self.filter_text}"', style="bold cyan")
         if self.paused:
             status.append("  PAUSED", style="bold yellow")
         lines.append(status)
@@ -370,10 +458,16 @@ class MemTaskManApp(App):
             ("Compressed", sm.compressed, "compression store" if WINDOWS else "zswap pool"),
         ]
         rows += [(k, v, "") for k, v in sm.extra.items()]
+        why = [(FIELD_LABELS.get(k, k), r) for k, r in sm.unavailable.items() if k != "page_faults_ps"]
         for label, value, note in rows:
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
-        w.update(Group(Text("System", style="bold"), t, *([note] if note else [])))
+        extra = []
+        if why:
+            extra.append(Text("Unavailable", style="bold dim"))
+            for label, reason in why:
+                extra.append(Text(f"  {label}: {reason}", style="dim"))
+        w.update(Group(Text("System", style="bold"), t, *([note] if note else []), *extra))
 
     def _ordered(self, snap: Snapshot) -> list[ProcessMem]:
         if self.group_mode == "cgroup" and snap.cgroups is not None:
@@ -382,6 +476,8 @@ class MemTaskManApp(App):
             procs = group_by_app(snap.processes)
         else:
             procs = snap.processes
+        if self.filter_text:
+            procs = [p for p in procs if matches(p, self.filter_text)]
         return sort_procs(procs, self.sort_key)
 
     def _row_key(self, p: ProcessMem) -> str:
@@ -430,17 +526,14 @@ class MemTaskManApp(App):
                 name,
                 Text(fmt_bytes(p.resident), justify="right"),
             ]
-            if UNIQUE:
+            if UNIQUE and self.compact_cols < 3:
                 cells.append(Text(fmt_bytes(getattr(p, UNIQUE[1])), justify="right"))
-            t.add_row(
-                *cells,
-                Text(fmt_bytes(p.private), justify="right"),
-                growth,
-                Text(fmt_count_rate(p.faults_ps), justify="right"),
-                Text(fmt_bytes(extra) if extra is not None else "-", justify="right"),
-                Text(rt, style="magenta" if p.runtime else ""),
-                key=k,
-            )
+            cells += [Text(fmt_bytes(p.private), justify="right"), growth]
+            if not self.compact_cols:
+                cells += [Text(fmt_count_rate(p.faults_ps), justify="right"),
+                          Text(fmt_bytes(extra) if extra is not None else "-", justify="right")]
+            cells.append(Text(rt, style="magenta" if p.runtime else ""))
+            t.add_row(*cells, key=k)
         if self.selected in self.rows:
             t.move_cursor(row=t.get_row_index(self.selected), animate=False, scroll=False)
         t.scroll_to(y=scroll_y, animate=False)
@@ -480,6 +573,7 @@ class MemTaskManApp(App):
         self.last_inspect = time.monotonic()
         self.inspect_worker(target, p.count)
 
+    @ui_callback
     def show_cgroup(self, row: ProcessMem) -> None:
         parts: list = []
         head = Text()
@@ -542,6 +636,7 @@ class MemTaskManApp(App):
         ins = self.collector.inspect(p)
         self.call_from_thread(self.show_inspection, ins, group_count)
 
+    @ui_callback
     def show_inspection(self, ins: Inspection, group_count: int = 1) -> None:
         self.inspection = ins
         parts: list = []
@@ -606,6 +701,11 @@ class MemTaskManApp(App):
                 line.append(f"{level:<11}", style=LEVEL_STYLE.get(level, ""))
                 line.append(text)
                 parts.append(line)
+        missing = {k: r for k, r in ins.unavailable.items() if k not in ("growth_ps", "faults_ps") or r != "needs two samples"}
+        if missing:
+            parts.append(Text("\nWhy some values show -", style="bold"))
+            for k, r in missing.items():
+                parts.append(Text(f"  {FIELD_LABELS.get(k, k)}: {r}", style="dim"))
         if ins.cmdline and not self.privacy:
             parts.append(Text("\n" + " ".join(ins.cmdline)[:300], style="dim"))
         parts.append(Text(f"\ninspected in {ins.elapsed * 1000:.0f} ms, refreshes every {INSPECT_EVERY:.0f}s", style="dim"))
@@ -644,13 +744,41 @@ class MemTaskManApp(App):
 
     def action_mode(self) -> None:
         self.screen.toggle_class("slim")
+        self._apply_size(self.size.width, self.size.height)  # slim frees the side panel's width
 
     def action_pause(self) -> None:
         self.paused = not self.paused
         self._refresh_now()
 
+    def action_filter(self) -> None:
+        inp = self.query_one("#filter", Input)
+        inp.add_class("visible")
+        inp.focus()
+
+    def action_clear_filter(self) -> None:
+        inp = self.query_one("#filter", Input)
+        if not inp.has_class("visible") and not self.filter_text:
+            return
+        inp.value = ""
+        inp.remove_class("visible")
+        self.filter_text = ""
+        self.query_one("#procs", DataTable).focus()
+        self._refresh_now()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self.filter_text = event.value.strip()
+            self._refresh_now()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "filter":
+            if not self.filter_text:
+                event.input.remove_class("visible")
+            self.query_one("#procs", DataTable).focus()
+
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
     def on_unmount(self) -> None:
+        self._shutting_down = True
         self.collector.close()

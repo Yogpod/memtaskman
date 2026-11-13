@@ -24,13 +24,39 @@ def _snapshot(args, collector=None):
     return c, snap
 
 
+def cmd_self_test() -> int:
+    """Run the real TUI headlessly for a few seconds (used to verify portable builds)."""
+    import asyncio
+
+    from memtaskman.app import MemTaskManApp
+
+    async def run() -> int:
+        app = MemTaskManApp(interval=0.5)
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(3.0)
+            rows = app.query_one("#procs").row_count
+            await pilot.press("down", "g", "question_mark", "escape", "slash", "a", "escape", "m")
+            await pilot.pause(1.0)
+        print(f"self-test: {rows} rows, inspector {'ok' if app.inspection else 'missing'}")
+        return 0 if rows > 0 else 1
+
+    return asyncio.run(run())
+
+
 def cmd_main(args) -> int:
+    if args.self_test:
+        return cmd_self_test()
     if args.once or args.json:
         from memtaskman import report
 
         c, snap = _snapshot(args)
         c.close()
+        if args.filter:
+            from memtaskman.collector import matches
+
+            snap.processes = [p for p in snap.processes if matches(p, args.filter)]
         if not args.all:
+            snap.truncated = len(snap.processes) > args.top
             snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
         print(report.to_json(snap) if args.json else report.render_text(snap, top=None))
         return 0
@@ -63,12 +89,25 @@ def cmd_inspect(args) -> int:
 
 
 def cmd_diff(args) -> int:
-    from memtaskman.diff import diff_snapshots
+    from memtaskman.diff import by_name, diff_data, render
 
     with open(args.a, encoding="utf-8") as fa, open(args.b, encoding="utf-8") as fb:
         a, b = json.load(fa), json.load(fb)
-    print(diff_snapshots(a, b, top=args.top))
+    if args.by_name:
+        print(by_name(a, b, top=args.top))
+        return 0
+    d = diff_data(a, b, threshold=args.threshold)
+    print(json.dumps(d, indent=2) if args.json else render(d, top=args.top))
     return 0
+
+
+def _size_arg(text: str) -> int:
+    from memtaskman.fmt import parse_size
+
+    v = parse_size(text)
+    if v is None:
+        raise argparse.ArgumentTypeError(f"bad size: {text!r} (use e.g. 0, 512k, 16m, 1g)")
+    return v
 
 
 def cmd_record(args) -> int:
@@ -83,9 +122,14 @@ def cmd_record(args) -> int:
             while (args.count == 0 or n < args.count) and (deadline is None or time.monotonic() < deadline):
                 time.sleep(args.interval)
                 snap = c.sample()
+                if args.filter:
+                    from memtaskman.collector import matches
+
+                    snap.processes = [p for p in snap.processes if matches(p, args.filter)]
                 if not args.all:
+                    snap.truncated = len(snap.processes) > args.top
                     snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
-                f.write(json.dumps(snap.to_dict(), separators=(",", ":")) + "\n")
+                f.write(json.dumps(snap.to_dict(compact=args.compact), separators=(",", ":")) + "\n")
                 f.flush()
                 n += 1
                 print(f"\rrecorded {n} snapshot(s) to {args.out}", end="", file=sys.stderr)
@@ -153,6 +197,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--filter", metavar="TEXT", help="only processes whose name, runtime or PID matches TEXT")
     p.add_argument("--privacy", action="store_true",
                    help="hide command lines and home-directory paths (for screenshots and screen sharing)")
     p.add_argument("--no-host", action="store_true",
@@ -169,6 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("a")
     d.add_argument("b")
     d.add_argument("--top", type=int, default=20)
+    d.add_argument("--json", action="store_true", help="machine-readable output with every change")
+    d.add_argument("--threshold", type=_size_arg, default=16 * 1024 * 1024,
+                   help="hide changes smaller than this in text output (default 16m)")
+    d.add_argument("--by-name", action="store_true", help="totals per executable name instead of per process")
     d.set_defaults(func=cmd_diff)
 
     r = sub.add_parser("record", help="append snapshots to a JSON Lines file")
@@ -179,6 +229,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--top", type=int, default=50)
     r.add_argument("--all", action="store_true")
     r.add_argument("--no-system", action="store_true")
+    r.add_argument("--filter", metavar="TEXT", help="only record matching processes")
+    r.add_argument("--compact", action="store_true",
+                   help="store only the fields diff/summary use (about 2.5x smaller)")
     r.set_defaults(func=cmd_record)
 
     sm = sub.add_parser("summary", help="find steadily growing processes in a `record` file")

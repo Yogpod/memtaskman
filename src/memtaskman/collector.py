@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -14,6 +15,10 @@ from memtaskman import leaks
 from memtaskman import runtime as rt
 from memtaskman.model import (
     CATEGORY_ORDER,
+    IDENTIFIED,
+    WHY_NEEDS_TWO,
+    WHY_OTHER_USER_LINUX,
+    WHY_OTHER_USER_MAC,
     DERIVED,
     MEASURED,
     HINT,
@@ -93,6 +98,7 @@ class Collector:
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
         self._cg_tracks: dict[str, _Track] = {}
+        self._pss_why: dict[tuple[int, float], str] = {}
         self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
         self._leaks: dict[tuple[int, float], leaks.Trend] = {}
         self._leaks_at = 0.0
@@ -172,12 +178,13 @@ class Collector:
                 if cg:
                     p.cgroup = f"{cg[0]}:{cg[1]}"
             self._rates(p, faults, now)
+            self._explain(p, faults)
             seen.add(p.key)
             out.append(p)
         for k in list(self._tracks):
             if k not in seen:
                 del self._tracks[k]
-        for cache in (self._runtimes, self._pss, self._series, self._leaks):
+        for cache in (self._runtimes, self._pss, self._series, self._leaks, self._pss_why):
             for k in list(cache):
                 if k not in seen:
                     del cache[k]
@@ -206,6 +213,32 @@ class Collector:
             p.faults_ps = prev.faults_ps = max(0.0, (faults - prev.faults) / dt)
         prev.t, prev.private, prev.faults = now, basis, faults
 
+    def _explain(self, p: ProcessMem, faults: int | None) -> None:
+        """Record why per-process values are missing, so the UI never shows a bare '-'."""
+        why = p.unavailable
+        if p.growth_ps is None:
+            why["growth_ps"] = WHY_NEEDS_TWO
+        if p.faults_ps is None:
+            why["faults_ps"] = WHY_NEEDS_TWO if faults is not None else "fault counter not readable"
+        if WINDOWS:
+            if p.uss is None and self._pws is not None:
+                why["uss"] = "not in the Process counter set (protected, or just started/exited)"
+            elif p.uss is None:
+                why["uss"] = "PDH Process counters unavailable on this system"
+        elif LINUX:
+            if p.private is None:
+                why["private"] = "kernel thread (no user memory)" if p.resident == 0 else "no RssAnon in /proc/<pid>/status"
+            if p.swapped is None:
+                why["swapped"] = "no VmSwap (kernel thread)"
+            if p.pss is None:
+                why["pss"] = self._pss_why.get(p.key, "PSS is read for visible rows only")
+        elif MACOS:
+            if p.private is None:
+                why["private"] = WHY_OTHER_USER_MAC
+            why["swapped"] = "macOS doesn't report swap per process (it's inside Footprint)"
+        else:
+            why["private"] = "not available on this platform"
+
     # ------------------------------------------------------------------ system
     def _system(self, now: float, procs: list[ProcessMem]) -> SystemMemory:
         vm = psutil.virtual_memory()
@@ -225,7 +258,29 @@ class Collector:
             sm.free = getattr(vm, "free", None)
             sm.cached = getattr(vm, "inactive", None)
             sm.extra = {k: getattr(vm, k) for k in ("active", "inactive", "wired") if hasattr(vm, k)}
+        self._explain_system(sm)
         return sm
+
+    def _explain_system(self, sm: SystemMemory) -> None:
+        why = sm.unavailable
+        if sm.page_faults_ps is None:
+            why["page_faults_ps"] = WHY_NEEDS_TWO
+        if WINDOWS:
+            if self._pdh is None or not self._pdh.counters:
+                why["standby"] = "PDH memory counters unavailable (disabled or corrupted: lodctr /r)"
+            if sm.compressed is None:
+                why["compressed"] = "MemCompression process not visible (compression off, or access denied)"
+        elif LINUX:
+            if sm.pressure_some is None:
+                why["pressure_some"] = "kernel without PSI (CONFIG_PSI off or psi=0 boot option)"
+            if sm.compressed is None:
+                why["compressed"] = "zswap not enabled"
+            if not sm.swap_total:
+                why["swap_total"] = "no swap configured"
+        elif MACOS:
+            why["commit_used"] = "macOS has no commit charge"
+            if sm.pressure_level is None:
+                why["pressure_level"] = "sysctl kern.memorystatus_vm_pressure_level unreadable"
 
     def _system_windows(self, sm: SystemMemory, procs: list[ProcessMem]) -> None:
         sm.source = "PDH + GetPerformanceInfo"
@@ -433,8 +488,10 @@ class Collector:
                 if time.perf_counter() > deadline:
                     break
                 r = native.rollup(p.pid)
-                if r is None:
-                    continue  # other users' processes: unreadable without root, left as None
+                if r is None:  # other users' processes: unreadable without root, left as None
+                    self._pss_why[p.key] = WHY_OTHER_USER_LINUX if _other_user(p.pid) else "smaps_rollup unreadable"
+                    p.unavailable["pss"] = self._pss_why[p.key]
+                    continue
                 p.pss, p.uss = r
                 self._pss[p.key] = (now, r[0], r[1])
                 done += 1
@@ -469,6 +526,7 @@ class Collector:
                 ins = Inspection(p.pid, p.name, error=f"{type(e).__name__}: {e}")
         if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
             self._add_wsl_guest(ins, p)
+        self._add_models(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
@@ -478,6 +536,7 @@ class Collector:
         if tr is not None:
             ins.evidence.insert(0, (DERIVED, "possible leak: " + leaks.describe(tr)))
         ins.cmdline = cmd
+        ins.unavailable = dict(p.unavailable)
         if info:
             ins.evidence = [e for e in info.evidence if e[1]] + ins.evidence
         elif not ins.error:
@@ -516,6 +575,32 @@ class Collector:
         if cache:
             ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
                                        "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
+
+    def _add_models(self, ins: Inspection, p: ProcessMem) -> None:
+        """Name memory-mapped model files and, for Ollama, report its RAM / VRAM split."""
+        from memtaskman import models
+        from memtaskman.fmt import fmt_bytes
+
+        for f in ins.top_files:
+            if not models.looks_like_model(f.path):
+                continue
+            meta = models.gguf_info(os.path.expandvars(f.path.replace("%SystemRoot%", "%SYSTEMROOT%")))
+            if not meta:
+                continue
+            size = meta["file_size"]
+            res = f.resident or 0
+            ins.evidence.insert(0, (IDENTIFIED, f"model file {models.describe_model(meta)}: {fmt_bytes(res)} of "
+                                                f"{fmt_bytes(size)} resident ({100 * res / max(size, 1):.0f}%)"))
+        if rt.stem(p.name) in ("ollama", "ollama_llama_server", "ollama app"):
+            loaded, why = models.ollama_loaded()
+            if loaded is None:
+                ins.evidence.append((HINT, why))
+            elif not loaded:
+                ins.evidence.append((MEASURED, "Ollama: no model loaded (GET /api/ps)"))
+            for m in loaded or []:
+                extra = " ".join(x for x in (m["params"], m["quant"]) if x)
+                ins.evidence.insert(0, (MEASURED, f"Ollama {m['name']} {extra}: {fmt_bytes(m['ram'])} in RAM, "
+                                                  f"{fmt_bytes(m['vram'])} in VRAM (of {fmt_bytes(m['size'])})"))
 
     def close(self) -> None:
         if self._pdh:
@@ -579,6 +664,25 @@ SORTS = {
     "name": lambda p: p.name.lower(),
     "pid": lambda p: p.pid,
 }
+
+
+def _other_user(pid: int) -> bool:
+    try:
+        import os
+
+        return os.stat(f"/proc/{pid}").st_uid != os.getuid()
+    except (OSError, AttributeError):
+        return False
+
+
+def matches(p: ProcessMem, text: str) -> bool:
+    """Case-insensitive filter on name, runtime label or exact PID."""
+    t = text.strip().lower()
+    if not t:
+        return True
+    if t.isdigit() and int(t) == p.pid:
+        return True
+    return t in p.name.lower() or t in f"{p.runtime or ''} {p.runtime_detail or ''}".lower()
 
 
 def sort_procs(procs: list[ProcessMem], key: str) -> list[ProcessMem]:

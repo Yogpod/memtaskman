@@ -1,7 +1,7 @@
 import unittest
 
 from memtaskman.app import ram_segments, stacked_bar
-from memtaskman.collector import Collector, group_by_app, sort_procs
+from memtaskman.collector import Collector, group_by_app, matches, sort_procs
 from memtaskman.diff import diff_snapshots
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, parse_size, redact
 from memtaskman.model import ProcessMem, Snapshot, SystemMemory
@@ -68,6 +68,17 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual([p.name for p in sort_procs(procs, "name")], ["a", "b", "c"])
 
 
+class FilterTests(unittest.TestCase):
+    def test_matches(self):
+        p = proc(4321, "chrome.exe", M, M, runtime="Chrome", runtime_detail="renderer")
+        self.assertTrue(matches(p, "CHROME"))
+        self.assertTrue(matches(p, "render"))
+        self.assertTrue(matches(p, "4321"))
+        self.assertTrue(matches(p, "  "))
+        self.assertFalse(matches(p, "432"))  # PIDs match exactly, not as substrings
+        self.assertFalse(matches(p, "firefox"))
+
+
 class RateTests(unittest.TestCase):
     def test_back_to_back_samples_keep_last_rates(self):
         c = Collector(system=False)
@@ -109,10 +120,40 @@ class ReportTests(unittest.TestCase):
         self.assertIn("4.00G / 16.0G used (25%)", out)
         self.assertIn("Java x.jar", out)
 
+    def test_diff_pairs_by_pid_and_start_time(self):
+        from memtaskman.diff import diff_data
+
+        a = self.snap(0, [proc(1, "a.exe", 100 * M, 100 * M), proc(7, "reused", 50 * M, 50 * M)], G).to_dict()
+        # pid 7 reused by a different process (different start time) -> gone + new, not "changed"
+        p7 = proc(7, "other", 80 * M, 80 * M)
+        p7.create_time = 99.0
+        b = self.snap(60, [proc(1, "a.exe", 300 * M, 150 * M), p7], G).to_dict()
+        st = {(e["name"], e["status"]) for e in diff_data(a, b)["processes"]}
+        self.assertIn(("a.exe", "changed"), st)
+        self.assertIn(("reused", "gone"), st)
+        self.assertIn(("other", "new"), st)
+
+    def test_diff_restarted_and_not_listed(self):
+        from memtaskman.diff import diff_data, render
+
+        a = self.snap(0, [proc(1, "svc.exe", 100 * M, 100 * M), proc(2, "tiny", M, M)], G)
+        b = self.snap(60, [proc(5, "svc.exe", 400 * M, 400 * M)], G)
+        b.truncated = True
+        d = diff_data(a.to_dict(), b.to_dict())
+        st = {e["name"]: e for e in d["processes"]}
+        self.assertEqual(st["svc.exe"]["status"], "restarted")
+        self.assertEqual(st["svc.exe"]["private_delta"], 300 * M)
+        self.assertEqual(st["tiny"]["status"], "not listed")
+        self.assertIsNone(st["tiny"]["private_delta"])
+        self.assertTrue(d["warnings"])
+        text = render(d)
+        self.assertIn("1->5", text)
+        self.assertIn("hidden", text)  # tiny is under the 16 MiB threshold
+
     def test_diff(self):
         a = self.snap(0, [proc(1, "a.exe", 100 * M, 50 * M), proc(2, "gone.exe", M, M)], 4 * G).to_dict()
         b = self.snap(60, [proc(1, "a.exe", 300 * M, 250 * M), proc(3, "new.exe", 2 * M, M)], 5 * G).to_dict()
-        out = diff_snapshots(a, b)
+        out = diff_snapshots(a, b, threshold=0)
         self.assertIn("Δt = 60s", out)
         self.assertIn("+1.00G", out)
         lines = out.splitlines()
