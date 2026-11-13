@@ -1,5 +1,7 @@
 # memtaskman
 
+[![CI](https://github.com/Yogpod/memtaskman/actions/workflows/ci.yml/badge.svg)](https://github.com/Yogpod/memtaskman/actions/workflows/ci.yml)
+
 An `htop` for what's **inside** your RAM, not just how full it is.
 
 Task Manager tells you Chrome uses 5 GB. memtaskman tells you which of those bytes are
@@ -133,9 +135,15 @@ Caveats:
 
 ```bash
 uv sync
-uv run python -m unittest discover -s tests -v
+uv run python -m unittest discover -s tests -v   # hardware-independent unit tests
+uv run python tools/smoke.py                      # live check: counters, inspector, TUI, every CLI command
 uv build
 ```
+
+CI (`.github/workflows/ci.yml`) runs the unit tests and the smoke test on Windows, Linux and
+macOS with Python 3.11 and 3.14, then builds the wheel and runs it. To release, bump `version`
+in `pyproject.toml`, then push a matching tag (`git tag v0.2.0 && git push main v0.2.0`). The release
+workflow tests, builds and attaches the sdist and wheel to a GitHub release.
 
 Layout:
 
@@ -152,6 +160,7 @@ src/memtaskman/
   diff.py       snapshot comparison
   fmt.py        byte & rate formatting
 tests/          hardware-independent unit tests
+tools/smoke.py  end-to-end check against the live machine (used by CI)
 ```
 
 ## License

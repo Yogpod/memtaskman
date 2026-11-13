@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: "1"
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+
+      - name: Install
+        run: uv sync --locked
+
+      - name: Unit tests
+        run: uv run --locked python -m unittest discover -s tests -v
+
+      - name: Smoke test (live counters, inspector, TUI, CLI)
+        run: uv run --locked python tools/smoke.py
+
+      - name: One-shot report
+        run: uv run --locked mtm --once --top 15
+
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - name: Install the built wheel and run it
+        run: |
+          uv venv /tmp/wheeltest
+          uv pip install --python /tmp/wheeltest dist/*.whl
+          /tmp/wheeltest/bin/mtm --version
+          /tmp/wheeltest/bin/mtm --once --top 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
