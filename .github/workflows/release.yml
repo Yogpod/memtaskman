@@ -59,9 +59,11 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: astral-sh/setup-uv@v10.3.3
       - name: Publish to PyPI
-        run: uv publish --trusted-publishing always dist/*
+        # Trusted publishing (OIDC): no API token. Pinned to the v1.14.3 commit.
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          packages-dir: dist/
 
   portable:
     # PyInstaller can't cross-compile: build on each target. Ubuntu 22.04 keeps glibc at 2.35
