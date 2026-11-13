@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, units_legend
 from memtaskman.model import Inspection, Snapshot, SystemMemory
 
 
@@ -48,7 +48,7 @@ def system_lines(sm: SystemMemory) -> list[str]:
 
 
 def render_text(snap: Snapshot, *, top: int | None = 25) -> str:
-    out: list[str] = []
+    out: list[str] = [f"Sizes: {units_legend()}"]
     if snap.system:
         out += system_lines(snap.system)
         out.append("")

@@ -198,6 +198,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--units", choices=["binary", "decimal"], default="binary",
+                   help="binary: 1G = 1 GiB (default, like OS counters); decimal: 1G = 1 GB (like Explorer)")
     p.add_argument("--filter", metavar="TEXT", help="only processes whose name, runtime or PID matches TEXT")
     p.add_argument("--privacy", action="store_true",
                    help="hide command lines and home-directory paths (for screenshots and screen sharing)")
@@ -244,6 +246,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    from memtaskman.fmt import set_units
+
+    set_units(getattr(args, "units", "binary") or "binary")
     if getattr(args, "func", None):
         return args.func(args)
     return cmd_main(args)

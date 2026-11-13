@@ -31,7 +31,7 @@ from memtaskman.collector import (
 )
 
 UNIQUE = unique_column()
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact, set_units, units, units_legend
 from memtaskman.model import (
     DERIVED,
     FIELD_LABELS,
@@ -130,7 +130,10 @@ HELP = f"""\
 [b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
   waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
 
-[b]Keys[/b]  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Units[/b] sizes use binary units by default (1G = 1 GiB = 1024³ bytes), like the OS counters.
+  u switches to decimal (1G = 1 GB = 10⁹ bytes), as used by Explorer and disk vendors.
+
+[b]Keys[/b]  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -234,6 +237,7 @@ class MemTaskManApp(App):
         Binding("m", "mode", "Slim"),
         Binding("p", "pause", "Pause"),
         Binding("slash", "filter", "Filter", key_display="/"),
+        Binding("u", "units", "Units", show=False),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
@@ -424,6 +428,7 @@ class MemTaskManApp(App):
         if sm0 and sm0.pressure_level:
             style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
             status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
+        status.append(f"  {'GiB' if units() == 'binary' else 'GB'}", style="dim")
         if self.filter_text:
             status.append(f'  filter "{self.filter_text}"', style="bold cyan")
         if self.paused:
@@ -791,6 +796,15 @@ class MemTaskManApp(App):
     def action_pause(self) -> None:
         self.paused = not self.paused
         self._refresh_now()
+
+    def action_units(self) -> None:
+        set_units("decimal" if units() == "binary" else "binary")
+        self.notify(units_legend(), timeout=2)
+        self.render_charts()
+        self.render_system()
+        self._refresh_now()
+        if self.inspection:
+            self.show_inspection(self.inspection)
 
     def action_filter(self) -> None:
         inp = self.query_one("#filter", Input)

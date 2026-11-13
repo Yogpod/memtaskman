@@ -149,6 +149,7 @@ table, but some of their values show `-`, and the inspector explains why. For th
 | Key        | Action                                   |
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
+| `u`        | binary (GiB) / decimal (GB) units |
 | `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
 | `s`        | cycle sort (or click any column header; click again to reverse) |
 | `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
@@ -167,6 +168,7 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --units decimal         1G = 1 GB (10⁹ bytes) instead of 1 GiB; JSON always stays in bytes
 mtm --once --filter brave   only processes matching a name, runtime or PID (also --json, record)
 mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
 mtm inspect PID [--json]    address-space breakdown of one process

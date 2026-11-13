@@ -25,6 +25,20 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(fmt_bytes(-2 * G), "-2.00G")
         self.assertEqual(fmt_bytes(G, long=True), "1.00GiB")
 
+    def test_decimal_units(self):
+        from memtaskman.fmt import set_units, units_legend
+
+        try:
+            set_units("decimal")
+            self.assertEqual(fmt_bytes(1_500_000_000), "1.50G")
+            self.assertEqual(fmt_bytes(G, long=True), "1.07GB")
+            self.assertIn("GB", units_legend())
+        finally:
+            set_units("binary")
+        self.assertEqual(fmt_bytes(1_500_000_000), "1.40G")
+        with self.assertRaises(ValueError):
+            set_units("metric")
+
     def test_rates(self):
         self.assertEqual(fmt_rate(None), "-")
         self.assertEqual(fmt_rate(10), "0")

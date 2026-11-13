@@ -5,17 +5,35 @@ from __future__ import annotations
 import re
 
 _UNITS = ["B", "K", "M", "G", "T", "P"]
+_base = 1024  # 1024: binary (KiB, MiB, GiB), 1000: decimal (kB, MB, GB)
+
+
+def set_units(mode: str) -> None:
+    """'binary' (default; what OS memory counters use) or 'decimal' (what disk vendors and Explorer use)."""
+    global _base
+    if mode not in ("binary", "decimal"):
+        raise ValueError(f"units must be 'binary' or 'decimal', not {mode!r}")
+    _base = 1024 if mode == "binary" else 1000
+
+
+def units() -> str:
+    return "binary" if _base == 1024 else "decimal"
+
+
+def units_legend() -> str:
+    """Spelled out, so a bare 'G' is never ambiguous."""
+    return "K/M/G = KiB/MiB/GiB (binary)" if _base == 1024 else "K/M/G = kB/MB/GB (decimal)"
 
 
 def fmt_bytes(n: float | int | None, *, long: bool = False) -> str:
-    """Format a byte count compactly using binary units: 0, 512B, 1.5K, 12M, 3.40G."""
+    """Format a byte count compactly: 0, 512B, 1.5K, 12M, 3.40G (binary units unless set_units('decimal'))."""
     if n is None:
         return "-"
     neg = n < 0
     v = float(abs(n))
     i = 0
-    while v >= 1024 and i < len(_UNITS) - 1:
-        v /= 1024
+    while v >= _base and i < len(_UNITS) - 1:
+        v /= _base
         i += 1
     if i == 0:
         s = f"{int(v)}B"
@@ -26,7 +44,7 @@ def fmt_bytes(n: float | int | None, *, long: bool = False) -> str:
     else:
         s = f"{v:.2f}{_UNITS[i]}"
     if long and i > 0:
-        s += "iB"
+        s += "iB" if _base == 1024 else "B"
     return ("-" if neg else "") + s
 
 
