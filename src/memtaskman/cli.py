@@ -24,7 +24,28 @@ def _snapshot(args, collector=None):
     return c, snap
 
 
+def cmd_self_test() -> int:
+    """Run the real TUI headlessly for a few seconds (used to verify portable builds)."""
+    import asyncio
+
+    from memtaskman.app import MemTaskManApp
+
+    async def run() -> int:
+        app = MemTaskManApp(interval=0.5)
+        async with app.run_test(size=(160, 48)) as pilot:
+            await pilot.pause(3.0)
+            rows = app.query_one("#procs").row_count
+            await pilot.press("down", "g", "question_mark", "escape", "slash", "a", "escape", "m")
+            await pilot.pause(1.0)
+        print(f"self-test: {rows} rows, inspector {'ok' if app.inspection else 'missing'}")
+        return 0 if rows > 0 else 1
+
+    return asyncio.run(run())
+
+
 def cmd_main(args) -> int:
+    if args.self_test:
+        return cmd_self_test()
     if args.once or args.json:
         from memtaskman import report
 
@@ -176,6 +197,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--filter", metavar="TEXT", help="only processes whose name, runtime or PID matches TEXT")
     p.add_argument("--privacy", action="store_true",
                    help="hide command lines and home-directory paths (for screenshots and screen sharing)")

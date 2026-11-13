@@ -1,16 +1,19 @@
 name: Release
 
-# Push a tag like v0.2.0 to build the package, attach it to a GitHub release
-# and publish it to PyPI.
+# Push a tag like v0.2.0 to build the package, attach it and portable builds to a
+# GitHub release, and publish it to PyPI. Running it manually (workflow_dispatch)
+# only builds the portable bundles as downloadable artifacts.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -59,3 +62,39 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
       - name: Publish to PyPI
         run: uv publish --trusted-publishing always dist/*
+
+  portable:
+    # PyInstaller can't cross-compile: build on each target. Ubuntu 22.04 keeps glibc at 2.35
+    # so the Linux bundles run on older distributions too.
+    needs: release
+    if: always() && (needs.release.result == 'success' || needs.release.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+          - os: windows-11-arm
+          - os: ubuntu-22.04
+          - os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Build, smoke-test and package
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          uv sync --locked
+          uv run --locked --with pyinstaller python tools/build_portable.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: portable-${{ matrix.os }}
+          path: dist/portable/
+      - name: Attach to the GitHub release
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/portable/*

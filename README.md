@@ -110,15 +110,22 @@ hosts (`vmmem`/`vmmemWSL`, QEMU, VMware, VirtualBox) and the Windows compression
 
 ## Install & run
 
+**From PyPI** (Python 3.11+):
+
 ```bash
-uv tool install .         # from a clone; or: pipx install .
-memtaskman                # or: mtm
+uv tool install memtaskman    # or: pipx install memtaskman
+mtm                           # or: memtaskman
 ```
 
-Without installing:
+**Portable, no Python needed:** download the zip (Windows x64 / ARM64) or tar.gz (Linux x64 /
+ARM64, glibc 2.35+) from the [latest release](https://github.com/Yogpod/memtaskman/releases/latest),
+extract it, and run `mtm` inside. Keep the `_internal` folder next to it. Each archive has a
+`.sha256` checksum; the builds are unsigned, so Windows SmartScreen may ask once.
+
+**From a clone:**
 
 ```bash
-uv run mtm
+uv run mtm                # or: uv tool install .
 ```
 
 The layout adapts to the terminal: below 150 columns the system panel and inspector move under
@@ -249,6 +256,7 @@ uv sync
 uv run python -m unittest discover -s tests -v   # hardware-independent unit tests
 uv run python tools/smoke.py                      # live check: counters, inspector, TUI, every CLI command
 uv build
+uv run --with pyinstaller python tools/build_portable.py   # portable bundle for this OS/CPU
 ```
 
 CI (`.github/workflows/ci.yml`) runs the unit tests and the smoke test on Windows, Linux and
