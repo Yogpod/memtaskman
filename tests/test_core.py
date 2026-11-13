@@ -66,6 +66,10 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual([p.pid for p in sort_procs(procs, "resident")], [2, 1, 3])
         self.assertEqual([p.pid for p in sort_procs(procs, "private")], [2, 1, 3])
         self.assertEqual([p.name for p in sort_procs(procs, "name")], ["a", "b", "c"])
+        self.assertEqual([p.pid for p in sort_procs(procs, "resident", invert=True)], [3, 1, 2])
+        self.assertEqual([p.name for p in sort_procs(procs, "name", invert=True)], ["c", "b", "a"])
+        procs[0].runtime, procs[1].runtime = "Java", ".NET"
+        self.assertEqual([p.runtime for p in sort_procs(procs, "runtime")], [".NET", "Java", None])  # unknown last
 
 
 class FilterTests(unittest.TestCase):

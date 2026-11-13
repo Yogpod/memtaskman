@@ -17,7 +17,18 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Sparkline, Static
 
-from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, matches, sort_procs, unique_column
+from memtaskman.collector import (
+    ASCENDING,
+    LINUX,
+    MACOS,
+    SORTS,
+    WINDOWS,
+    Collector,
+    group_by_app,
+    matches,
+    sort_procs,
+    unique_column,
+)
 
 UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
@@ -119,7 +130,7 @@ HELP = f"""\
 [b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
   waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
 
-[b]Keys[/b]  ↑/↓ select  / filter  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Keys[/b]  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -236,6 +247,8 @@ class MemTaskManApp(App):
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
         self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
+        self.sort_invert = False  # second click on the same header reverses the order
+        self.col_labels: dict[str, str] = {}
         self.show_all = False
         self.group_mode = "none"  # none | app | cgroup (Linux)
         self.filter_text = ""
@@ -315,6 +328,33 @@ class MemTaskManApp(App):
             t.add_column("Faults/s", key="faults", width=8)
             t.add_column(last, key="extra", width=7)
         t.add_column("Runtime", key="runtime", width=(24, 18, 14, 14)[self.compact_cols])
+        self.col_labels = {str(k.value): str(c.label) for k, c in t.columns.items()}
+        self._update_header_arrows()
+
+    def _sort_for_column(self, column_key: str) -> str:
+        return "count" if column_key == "pid" and self.grouped else column_key
+
+    def _update_header_arrows(self) -> None:
+        t = self.query_one("#procs", DataTable)
+        descending = (self.sort_key not in ASCENDING) != self.sort_invert
+        for key, col in t.columns.items():
+            base = self.col_labels.get(str(key.value), str(col.label))
+            if self._sort_for_column(str(key.value)) == self.sort_key:
+                col.label = Text(f"{base} {'▼' if descending else '▲'}", style="bold")
+            else:
+                col.label = Text(base)
+        t.refresh()
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        key = self._sort_for_column(str(event.column_key.value))
+        if key not in SORTS:
+            return
+        if key == self.sort_key:
+            self.sort_invert = not self.sort_invert
+        else:
+            self.sort_key, self.sort_invert = key, False
+        self._update_header_arrows()
+        self._refresh_now()
 
     def collector_private_label(self) -> str:
         from memtaskman.collector import private_label
@@ -478,7 +518,7 @@ class MemTaskManApp(App):
             procs = snap.processes
         if self.filter_text:
             procs = [p for p in procs if matches(p, self.filter_text)]
-        return sort_procs(procs, self.sort_key)
+        return sort_procs(procs, self.sort_key, self.sort_invert)
 
     def _row_key(self, p: ProcessMem) -> str:
         if self.group_mode == "cgroup":
@@ -718,8 +758,10 @@ class MemTaskManApp(App):
             self.render_table()
 
     def action_sort(self) -> None:
-        self.sort_key = self.sort_keys[(self.sort_keys.index(self.sort_key) + 1) % len(self.sort_keys)]
+        i = self.sort_keys.index(self.sort_key) if self.sort_key in self.sort_keys else -1
+        self.sort_key, self.sort_invert = self.sort_keys[(i + 1) % len(self.sort_keys)], False
         self.notify(f"sort: {self.sort_key}", timeout=1.5)
+        self._update_header_arrows()
         self._refresh_now()
 
     def action_group(self) -> None:

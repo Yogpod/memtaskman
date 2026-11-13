@@ -150,7 +150,7 @@ table, but some of their values show `-`, and the inspector explains why. For th
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
 | `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
-| `s`        | cycle sort: resident, PSS (Linux), private, growth, faults, name, pid |
+| `s`        | cycle sort (or click any column header; click again to reverse) |
 | `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
 | `a`        | top 50 / all processes                   |
 | `c`        | cycle charts (all, or one metric)        |

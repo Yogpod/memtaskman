@@ -111,6 +111,14 @@ async def tui_checks() -> None:
         await pilot.press("escape")
         await pilot.pause(0.3)
         check(app.screen is not None, "help screen opens and closes")
+        app.on_data_table_header_selected(type("E", (), {"column_key": type("K", (), {"value": "name"})()})())
+        await pilot.pause(0.3)
+        first = [p.name.lower() for p in list(app.rows.values())[:5]]
+        check(app.sort_key == "name" and first == sorted(first), "header click sorts by name")
+        app.on_data_table_header_selected(type("E", (), {"column_key": type("K", (), {"value": "name"})()})())
+        await pilot.pause(0.3)
+        check(app.sort_invert, "second header click reverses")
+        app.sort_key, app.sort_invert = "resident", False
         target = app.snapshot.processes[0].name[:4]
         await pilot.press("slash", *list(target.lower()))
         await pilot.pause(0.5)

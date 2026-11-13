@@ -663,7 +663,11 @@ SORTS = {
     "faults": lambda p: p.faults_ps or 0,
     "name": lambda p: p.name.lower(),
     "pid": lambda p: p.pid,
+    "count": lambda p: p.count,
+    "extra": lambda p: ((p.paged_pool or 0) + (p.nonpaged_pool or 0)) if p.paged_pool is not None else (p.swapped or 0),
+    "runtime": lambda p: (p.runtime is None, f"{p.runtime or ''} {p.runtime_detail or ''}".lower()),
 }
+ASCENDING = {"name", "pid", "runtime"}  # natural order is A-Z / low-high; everything else largest first
 
 
 def _other_user(pid: int) -> bool:
@@ -685,5 +689,7 @@ def matches(p: ProcessMem, text: str) -> bool:
     return t in p.name.lower() or t in f"{p.runtime or ''} {p.runtime_detail or ''}".lower()
 
 
-def sort_procs(procs: list[ProcessMem], key: str) -> list[ProcessMem]:
-    return sorted(procs, key=SORTS[key], reverse=key not in ("name", "pid"))
+def sort_procs(procs: list[ProcessMem], key: str, invert: bool = False) -> list[ProcessMem]:
+    """Sort by a SORTS key in its natural direction; invert=True flips it."""
+    descending = key not in ASCENDING
+    return sorted(procs, key=SORTS[key], reverse=descending != invert)
