@@ -248,22 +248,29 @@ class MemTaskManApp(App):
     ]
 
     def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
-                 privacy: bool = False):
+                 privacy: bool = False, settings: dict | None = None):
         super().__init__()
+        settings = settings or {}
         self.privacy = privacy  # hide command lines and home-directory paths (screenshots, demos)
         self.interval = max(0.25, interval)
         self.collector = Collector(system=system, wsl_guest=wsl_guest)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
         self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
+        if settings.get("sort") in self.sort_keys:
+            self.sort_key = settings["sort"]
         self.sort_invert = False  # second click on the same header reverses the order
-        self.tree_mode = False
+        self.tree_mode = bool(settings.get("tree", False))
+        self.top_n = int(settings.get("top", TOP_N))
+        self.start_slim = bool(settings.get("slim", False))
         self.tree_collapsed: set = set()  # explicit user choices, by process key
         self.tree_expanded: set = set()
         self.tree_rows: dict[str, ptree.TreeRow] = {}
         self.col_labels: dict[str, str] = {}
-        self.show_all = False
-        self.group_mode = "none"  # none | app | cgroup (Linux)
+        self.show_all = bool(settings.get("all", False))
+        self.group_mode = settings.get("group", "none")  # none | app | cgroup (Linux)
+        if self.group_mode not in GROUP_MODES:
+            self.group_mode = "none"
         self.filter_text = ""
         self.compact_cols = 0  # column tier, see _column_tier
         self.paused = False
@@ -318,6 +325,8 @@ class MemTaskManApp(App):
                 self.render_table()
 
     def on_mount(self) -> None:
+        if self.start_slim:
+            self.screen.add_class("slim")
         self.compact_cols = self._column_tier(self.size.width)
         self._apply_size(self.size.width, self.size.height)
         self._setup_columns()
@@ -382,9 +391,9 @@ class MemTaskManApp(App):
     @work(thread=True, exclusive=True, group="sample")
     def sample(self) -> None:
         snap = self.collector.sample()
-        visible = sort_procs(snap.processes, "resident")[: TOP_N if not self.show_all else None]
+        visible = sort_procs(snap.processes, "resident")[: self.top_n if not self.show_all else None]
         if self.group_mode == "none":
-            visible = self._ordered(snap)[: TOP_N if not self.show_all else None]
+            visible = self._ordered(snap)[: self.top_n if not self.show_all else None]
         self.collector.resolve_runtimes(visible + sort_procs(snap.processes, "resident"), time_budget=0.3)
         self.collector.refresh_pss(visible, time_budget=0.2)
         self.call_from_thread(self.apply, snap)
@@ -429,7 +438,7 @@ class MemTaskManApp(App):
         mode = {"none": "tree" if self.tree_mode else "per process", "app": "grouped by app",
                 "cgroup": "grouped by cgroup"}[self.group_mode]
         status.append(f"  sort:{self.sort_key}  {mode}"
-                      f"  {'all' if self.show_all else f'top {TOP_N}'}  {len(snap.processes)} processes", style="dim")
+                      f"  {'all' if self.show_all else f'top {self.top_n}'}  {len(snap.processes)} processes", style="dim")
         sm0 = snap.system
         if sm0 and sm0.pressure_some is not None:
             full = sm0.pressure_full or 0.0
@@ -550,7 +559,7 @@ class MemTaskManApp(App):
         t = self.query_one("#procs", DataTable)
         procs = self._ordered(self.snapshot)
         if not self.show_all:
-            procs = procs[:TOP_N]
+            procs = procs[: self.top_n]
         if self.selected and not any(self._row_key(p) == self.selected for p in procs):
             # Keep the selected process visible even when it drops out of the top N.
             sel = next((p for p in self._ordered(self.snapshot) if self._row_key(p) == self.selected), None)

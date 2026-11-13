@@ -132,6 +132,29 @@ The layout adapts to the terminal: below 150 columns the system panel and inspec
 the table, less important columns are dropped as space runs out, and charts are hidden below 36
 rows. It's usable down to 80×24; the full view wants about 190 columns.
 
+### Configuration
+
+Defaults can live in a TOML file; command-line flags always win.
+
+| OS | Location |
+|---|---|
+| Windows | `%APPDATA%\memtaskman\config.toml` |
+| Linux | `~/.config/memtaskman/config.toml` (or `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/memtaskman/config.toml` |
+
+```toml
+sort = "growth"      # resident | pss | uss | private | growth | faults | name | pid
+group = "none"       # none | app | cgroup
+tree = true
+top = 40
+units = "decimal"    # binary (GiB) | decimal (GB)
+interval = 2.0
+```
+
+`mtm --print-config` prints every setting with its effective value and whether it came from a
+flag, the file or the default, as TOML you can paste into the file. `MEMTASKMAN_CONFIG` points
+to a different file. Unknown keys and bad values are reported and ignored, never fatal.
+
 ### Permissions
 
 memtaskman works without admin rights. Other users' and services' processes still appear in the
@@ -169,6 +192,8 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --sort growth --tree     initial sort / view (also --group app|cgroup, --slim)
+mtm --print-config          effective settings (config file + flags) as TOML
 mtm --units decimal         1G = 1 GB (10⁹ bytes) instead of 1 GiB; JSON always stays in bytes
 mtm --once --filter brave   only processes matching a name, runtime or PID (also --json, record)
 mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
