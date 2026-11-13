@@ -581,5 +581,15 @@ SORTS = {
 }
 
 
+def matches(p: ProcessMem, text: str) -> bool:
+    """Case-insensitive filter on name, runtime label or exact PID."""
+    t = text.strip().lower()
+    if not t:
+        return True
+    if t.isdigit() and int(t) == p.pid:
+        return True
+    return t in p.name.lower() or t in f"{p.runtime or ''} {p.runtime_detail or ''}".lower()
+
+
 def sort_procs(procs: list[ProcessMem], key: str) -> list[ProcessMem]:
     return sorted(procs, key=SORTS[key], reverse=key not in ("name", "pid"))

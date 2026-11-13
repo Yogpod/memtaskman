@@ -14,9 +14,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Sparkline, Static
+from textual.widgets import DataTable, Footer, Input, Sparkline, Static
 
-from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, sort_procs, unique_column
+from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, matches, sort_procs, unique_column
 
 UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
@@ -94,7 +94,7 @@ HELP = f"""\
 [b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
   waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
 
-[b]Keys[/b]  ↑/↓ select  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Keys[/b]  ↑/↓ select  / filter  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -141,6 +141,7 @@ def ram_segments(sm: SystemMemory) -> list[tuple[str, int, str]]:
 
 class MemTaskManApp(App):
     TITLE = "memtaskman"
+    AUTO_FOCUS = "#procs"  # never the (hidden) filter input, or it would swallow every key
     CSS = """
     Screen { layout: vertical; }
     #top { height: auto; padding: 0 1; }
@@ -156,6 +157,8 @@ class MemTaskManApp(App):
     #system { height: auto; padding: 0 1; }
     #inspector { height: 1fr; padding: 0 1; }
     .slim #charts, .slim #side { display: none; }
+    #filter { display: none; height: 3; margin: 0 1; }
+    #filter.visible { display: block; }
     HelpScreen { align: center middle; }
     #help { width: 100; max-width: 95%; height: 80%; border: round $accent; background: $surface; padding: 1 2; }
     """
@@ -167,7 +170,9 @@ class MemTaskManApp(App):
         Binding("c", "charts", "Charts"),
         Binding("m", "mode", "Slim"),
         Binding("p", "pause", "Pause"),
+        Binding("slash", "filter", "Filter", key_display="/"),
         Binding("question_mark", "help", "Help", key_display="?"),
+        Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
 
     def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
@@ -181,6 +186,7 @@ class MemTaskManApp(App):
         self.sort_key = "resident"
         self.show_all = False
         self.group_mode = "none"  # none | app | cgroup (Linux)
+        self.filter_text = ""
         self.paused = False
         self.chart_mode = -1  # -1 = all charts, else index into CHARTS
         self.snapshot: Snapshot | None = None
@@ -207,6 +213,7 @@ class MemTaskManApp(App):
                 yield Static(id="system")
                 with VerticalScroll(id="inspector"):
                     yield Static("Select a process to see what its memory is made of.", id="inspect-body")
+        yield Input(placeholder="filter by name, runtime or PID   (Enter keeps it, Esc clears)", id="filter")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -298,6 +305,8 @@ class MemTaskManApp(App):
         if sm0 and sm0.pressure_level:
             style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
             status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
+        if self.filter_text:
+            status.append(f'  filter "{self.filter_text}"', style="bold cyan")
         if self.paused:
             status.append("  PAUSED", style="bold yellow")
         lines.append(status)
@@ -382,6 +391,8 @@ class MemTaskManApp(App):
             procs = group_by_app(snap.processes)
         else:
             procs = snap.processes
+        if self.filter_text:
+            procs = [p for p in procs if matches(p, self.filter_text)]
         return sort_procs(procs, self.sort_key)
 
     def _row_key(self, p: ProcessMem) -> str:
@@ -648,6 +659,32 @@ class MemTaskManApp(App):
     def action_pause(self) -> None:
         self.paused = not self.paused
         self._refresh_now()
+
+    def action_filter(self) -> None:
+        inp = self.query_one("#filter", Input)
+        inp.add_class("visible")
+        inp.focus()
+
+    def action_clear_filter(self) -> None:
+        inp = self.query_one("#filter", Input)
+        if not inp.has_class("visible") and not self.filter_text:
+            return
+        inp.value = ""
+        inp.remove_class("visible")
+        self.filter_text = ""
+        self.query_one("#procs", DataTable).focus()
+        self._refresh_now()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "filter":
+            self.filter_text = event.value.strip()
+            self._refresh_now()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "filter":
+            if not self.filter_text:
+                event.input.remove_class("visible")
+            self.query_one("#procs", DataTable).focus()
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())

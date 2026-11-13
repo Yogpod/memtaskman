@@ -111,6 +111,16 @@ async def tui_checks() -> None:
         await pilot.press("escape")
         await pilot.pause(0.3)
         check(app.screen is not None, "help screen opens and closes")
+        target = app.snapshot.processes[0].name[:4]
+        await pilot.press("slash", *list(target.lower()))
+        await pilot.pause(0.5)
+        names = [p.name for p in app.rows.values()]
+        check(app.filter_text == target.lower() and names and all(target.lower() in n.lower() or
+              target.lower() in (p.runtime or "").lower() for n, p in zip(names, app.rows.values())),
+              f"filter '/{target.lower()}' -> {len(names)} rows")
+        await pilot.press("escape")
+        await pilot.pause(0.5)
+        check(app.filter_text == "" and len(app.rows) > len(names), "Esc clears the filter")
 
 
 def run(*args: str) -> subprocess.CompletedProcess:

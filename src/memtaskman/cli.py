@@ -30,6 +30,10 @@ def cmd_main(args) -> int:
 
         c, snap = _snapshot(args)
         c.close()
+        if args.filter:
+            from memtaskman.collector import matches
+
+            snap.processes = [p for p in snap.processes if matches(p, args.filter)]
         if not args.all:
             snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
         print(report.to_json(snap) if args.json else report.render_text(snap, top=None))
@@ -83,6 +87,10 @@ def cmd_record(args) -> int:
             while (args.count == 0 or n < args.count) and (deadline is None or time.monotonic() < deadline):
                 time.sleep(args.interval)
                 snap = c.sample()
+                if args.filter:
+                    from memtaskman.collector import matches
+
+                    snap.processes = [p for p in snap.processes if matches(p, args.filter)]
                 if not args.all:
                     snap.processes = sorted(snap.processes, key=lambda p: p.resident, reverse=True)[: args.top]
                 f.write(json.dumps(snap.to_dict(), separators=(",", ":")) + "\n")
@@ -153,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--filter", metavar="TEXT", help="only processes whose name, runtime or PID matches TEXT")
     p.add_argument("--privacy", action="store_true",
                    help="hide command lines and home-directory paths (for screenshots and screen sharing)")
     p.add_argument("--no-host", action="store_true",
@@ -179,6 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--top", type=int, default=50)
     r.add_argument("--all", action="store_true")
     r.add_argument("--no-system", action="store_true")
+    r.add_argument("--filter", metavar="TEXT", help="only record matching processes")
     r.set_defaults(func=cmd_record)
 
     sm = sub.add_parser("summary", help="find steadily growing processes in a `record` file")

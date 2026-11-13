@@ -1,7 +1,7 @@
 import unittest
 
 from memtaskman.app import ram_segments, stacked_bar
-from memtaskman.collector import Collector, group_by_app, sort_procs
+from memtaskman.collector import Collector, group_by_app, matches, sort_procs
 from memtaskman.diff import diff_snapshots
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, parse_size, redact
 from memtaskman.model import ProcessMem, Snapshot, SystemMemory
@@ -66,6 +66,17 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual([p.pid for p in sort_procs(procs, "resident")], [2, 1, 3])
         self.assertEqual([p.pid for p in sort_procs(procs, "private")], [2, 1, 3])
         self.assertEqual([p.name for p in sort_procs(procs, "name")], ["a", "b", "c"])
+
+
+class FilterTests(unittest.TestCase):
+    def test_matches(self):
+        p = proc(4321, "chrome.exe", M, M, runtime="Chrome", runtime_detail="renderer")
+        self.assertTrue(matches(p, "CHROME"))
+        self.assertTrue(matches(p, "render"))
+        self.assertTrue(matches(p, "4321"))
+        self.assertTrue(matches(p, "  "))
+        self.assertFalse(matches(p, "432"))  # PIDs match exactly, not as substrings
+        self.assertFalse(matches(p, "firefox"))
 
 
 class RateTests(unittest.TestCase):
