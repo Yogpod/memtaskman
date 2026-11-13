@@ -68,6 +68,10 @@ home directories are shown as `~`.
   that walks regions like `vmmap`. It splits malloc heaps, stacks, **Graphics / GPU** (IOKit,
   IOSurface, IOAccelerator, CoreAnimation), **JIT / JavaScript**, dylibs plus the dyld shared
   cache (counted once), and mapped files.
+- **AI models in RAM**: memory-mapped GGUF files (llama.cpp, Ollama, LM Studio) are named from
+  their header, e.g. `Qwen3 14B Q4_K_M: 3.9G of 8.6G resident (45%)`. Only the header is read,
+  never the weights. Inspecting an Ollama process asks its local API (`GET /api/ps`, localhost
+  only, 0.5 s timeout) how each loaded model is split between RAM and VRAM.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
 - **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from memtaskman import leaks
 from memtaskman import runtime as rt
 from memtaskman.model import (
     CATEGORY_ORDER,
+    IDENTIFIED,
     WHY_NEEDS_TWO,
     WHY_OTHER_USER_LINUX,
     WHY_OTHER_USER_MAC,
@@ -524,6 +526,7 @@ class Collector:
                 ins = Inspection(p.pid, p.name, error=f"{type(e).__name__}: {e}")
         if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
             self._add_wsl_guest(ins, p)
+        self._add_models(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
@@ -572,6 +575,32 @@ class Collector:
         if cache:
             ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
                                        "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
+
+    def _add_models(self, ins: Inspection, p: ProcessMem) -> None:
+        """Name memory-mapped model files and, for Ollama, report its RAM / VRAM split."""
+        from memtaskman import models
+        from memtaskman.fmt import fmt_bytes
+
+        for f in ins.top_files:
+            if not models.looks_like_model(f.path):
+                continue
+            meta = models.gguf_info(os.path.expandvars(f.path.replace("%SystemRoot%", "%SYSTEMROOT%")))
+            if not meta:
+                continue
+            size = meta["file_size"]
+            res = f.resident or 0
+            ins.evidence.insert(0, (IDENTIFIED, f"model file {models.describe_model(meta)}: {fmt_bytes(res)} of "
+                                                f"{fmt_bytes(size)} resident ({100 * res / max(size, 1):.0f}%)"))
+        if rt.stem(p.name) in ("ollama", "ollama_llama_server", "ollama app"):
+            loaded, why = models.ollama_loaded()
+            if loaded is None:
+                ins.evidence.append((HINT, why))
+            elif not loaded:
+                ins.evidence.append((MEASURED, "Ollama: no model loaded (GET /api/ps)"))
+            for m in loaded or []:
+                extra = " ".join(x for x in (m["params"], m["quant"]) if x)
+                ins.evidence.insert(0, (MEASURED, f"Ollama {m['name']} {extra}: {fmt_bytes(m['ram'])} in RAM, "
+                                                  f"{fmt_bytes(m['vram'])} in VRAM (of {fmt_bytes(m['size'])})"))
 
     def close(self) -> None:
         if self._pdh:
