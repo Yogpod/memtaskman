@@ -143,7 +143,8 @@ uv build
 CI (`.github/workflows/ci.yml`) runs the unit tests and the smoke test on Windows, Linux and
 macOS with Python 3.11 and 3.14, then builds the wheel and runs it. To release, bump `version`
 in `pyproject.toml`, then push a matching tag (`git tag v0.2.0 && git push main v0.2.0`). The release
-workflow tests, builds and attaches the sdist and wheel to a GitHub release.
+workflow tests, builds, attaches the sdist and wheel to a GitHub release and publishes them
+to PyPI.
 
 Layout:
 
