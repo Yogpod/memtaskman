@@ -184,6 +184,7 @@ FIELD_LABELS = {
     "standby": "Standby", "modified": "Modified", "compressed": "Compressed", "commit_used": "Commit",
     "pressure_some": "Memory pressure", "pressure_level": "Memory pressure", "page_faults_ps": "Page faults/s",
     "kernel_paged": "Kernel pools", "swap_total": "Swap", "free": "Free", "cached": "Cache",
+    "slab_top": "Slab caches", "pool_tags": "Pool tags",
 }
 
 # Common reasons, kept short: they are shown in a narrow side panel.

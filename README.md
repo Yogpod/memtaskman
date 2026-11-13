@@ -40,10 +40,16 @@ home directories are shown as `~`.
 
 ## What you get
 
+The screen is one stack, top to bottom, like gputaskman: **Memory** (the full diagnostics:
+status line, RAM / commit / swap bars), **System** (OS-reported figures), **Charts**, the
+**process list**, and the **inspector** for whatever you select. Slim mode (`m`) keeps just
+the bars and the list, and short terminals drop the System and Charts boxes.
+
 - **System bar**: RAM split into *In use / Modified / Standby / Free* (Windows) or
   *In use / Cache / Free* (Linux), plus commit charge and swap/pagefile bars.
-- **Eight history charts**: RAM in use, commit, standby/cache, compressed, swap,
-  kernel pools, page faults/s and hard faults/s. `c` cycles to a single large chart.
+- **Eight history charts** on fixed scales (RAM charts 0 to total RAM, commit 0 to the limit):
+  RAM in use, commit, standby/cache, compressed, swap, kernel pools, page faults/s and hard
+  faults/s. Pick one from the Charts dropdown, or press `c` to cycle.
 - **System panel**: available memory, modified/dirty, standby/page cache, kernel paged
   and nonpaged pools (slab on Linux), compression store, driver-resident bytes, commit peak.
 - **Process table**: resident (working set / RSS), private commit (Windows) or anonymous
@@ -145,9 +151,9 @@ extract it, and run `mtm` inside. Keep the `_internal` folder next to it. Each a
 uv run mtm                # or: uv tool install .
 ```
 
-The layout adapts to the terminal: below 150 columns the system panel and inspector move under
-the table, less important columns are dropped as space runs out, and charts are hidden below 36
-rows. It's usable down to 80×24; the full view wants about 190 columns.
+The layout adapts to the terminal: less important columns are dropped as width runs out, and
+below 36 rows the System and Charts boxes are hidden so the list keeps its space. It's usable
+down to 80×24; all columns fit from about 130 columns.
 
 ### Configuration
 

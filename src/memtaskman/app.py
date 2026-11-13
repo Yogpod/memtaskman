@@ -12,10 +12,10 @@ from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.screen import ModalScreen
-from textual.widgets import DataTable, Footer, Input, Sparkline, Static
+from textual.widgets import DataTable, Footer, Input, Select, Static
 
 from memtaskman.collector import (
     ASCENDING,
@@ -47,13 +47,23 @@ from memtaskman.model import (
 )
 
 HISTORY = 120
-SIDE_W = 65  # side panel width incl. border
-NARROW_W = 150  # below this the side panel moves under the table
 # Column tiers chosen from the width left for the table (cells include 2 columns of padding):
 FULL_COLS_W = 128  # tier 0: all columns
 MID_COLS_W = 104  # tier 1: drop Faults/s and Pool/Swap, shorter Runtime
 SMALL_COLS_W = 92  # tier 2: also shorter Name and Runtime; below (tier 3): also drop PSS/PrivWS
 SHORT_H = 36  # below this the charts are hidden
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def spark(values: list[float], width: int, scale: float) -> Text:
+    """Last `width` samples as a one-line sparkline on a fixed 0..scale axis (blank = no sample)."""
+    vals = values[-width:] if width > 0 else []
+    out = Text(" " * (width - len(vals)))
+    top = len(SPARK) - 1
+    for v in vals:
+        frac = 0.0 if scale <= 0 else max(0.0, min(1.0, v / scale))
+        out.append(SPARK[round(frac * top)])
+    return out
 TOP_N = 50
 INSPECT_EVERY = 5.0
 
@@ -64,6 +74,11 @@ C_FREE = "#3a3f4b"
 C_COMMIT = "#b48ead"
 C_SWAP = "#d08770"
 
+CHART_COLORS = {
+    "used": "#60a5fa", "commit": "#b48ead", "cache": "#57a773", "compressed": "#a78bfa", "pressure": "#ef4444",
+    "wired": "#fb923c", "swap": "#d08770", "kernel": "#fbbf24", "faults": "#4ade80", "hard": "#f87171",
+}
+
 CHARTS = [
     ("used", "RAM in use", "bytes"),
     ("commit", "Commit charge", "bytes"),
@@ -72,7 +87,7 @@ CHARTS = [
     ("swap", "Swap / pagefile used", "bytes"),
     ("kernel", "Kernel pools", "bytes"),
     ("faults", "Page faults/s", "rate"),
-    ("hard", "Hard faults/s (disk)", "rate"),
+    ("hard", "Hard faults/s", "rate"),
 ]
 if LINUX:  # zswap is often off; memory pressure (PSI) is the better Linux signal
     CHARTS[3] = ("pressure", "Memory pressure (PSI some %)", "pct")
@@ -247,24 +262,20 @@ class MemTaskManApp(App):
     AUTO_FOCUS = "#procs"  # never the (hidden) filter input, or it would swallow every key
     CSS = """
     Screen { layout: vertical; }
-    #top { height: auto; padding: 0 1; }
-    #charts { grid-size: 4 2; grid-gutter: 0 2; height: 8; padding: 0 1; }
-    #charts.single { grid-size: 1 1; height: 10; }
-    .chart { height: 4; }
-    #charts.single .chart { height: 10; }
-    .chart Sparkline { height: 1fr; }
-    .chart .label { height: 1; color: $text-muted; }
-    #body { height: 1fr; }
-    #procs { width: 1fr; }
-    #side { width: 64; border-left: tall $panel; }
-    #system { height: auto; padding: 0 1; }
-    #inspector { height: 1fr; padding: 0 1; }
-    .slim #charts, .slim #side { display: none; }
-    .narrow #body { layout: vertical; }
-    .narrow #procs { height: 1fr; }
-    .narrow #side { width: 1fr; height: 45%; border-left: none; border-top: tall $panel; }
-    .narrow #charts { grid-size: 2 4; height: 16; }
-    .short #charts { display: none; }
+    #dashboard { height: auto; max-height: 50%; }
+    #device { height: auto; border: round $accent; padding: 0 1; }
+    #system { height: auto; border: round $success; padding: 0 1; }
+    #history { height: auto; border: round $secondary; padding: 0 1; }
+    #chart-controls { height: 1; }
+    #chart-label { width: 8; text-style: bold; }
+    #chart-mode { width: 30; }
+    #chart-hint { width: 1fr; color: $text-muted; }
+    #charts { height: auto; }
+    #chart-note { height: auto; color: $text-muted; }
+    #procs { height: 1fr; min-height: 4; }
+    #inspector { height: auto; max-height: 30%; border: round $secondary; padding: 0 1; }
+    .slim #system, .slim #history { display: none; }
+    .short #history, .short #system { display: none; }
     #filter { display: none; height: 3; margin: 0 1; }
     #filter.visible { display: block; }
     HelpScreen { align: center middle; }
@@ -332,34 +343,49 @@ class MemTaskManApp(App):
         return self.group_mode != "none"
 
     def compose(self) -> ComposeResult:
-        yield Static(id="top")
-        with Grid(id="charts"):
-            for key, label, _ in CHARTS:
-                with Vertical(classes="chart", id=f"chart-{key}"):
-                    yield Static(label, classes="label", id=f"label-{key}")
-                    yield Sparkline([], summary_function=max, id=f"spark-{key}")
-        with Horizontal(id="body"):
-            yield DataTable(id="procs", cursor_type="row", zebra_stripes=True)
-            with Vertical(id="side"):
-                yield Static(id="system")
-                with VerticalScroll(id="inspector"):
-                    yield Static("Select a process to see what its memory is made of.", id="inspect-body")
+        # Same stack as gputaskman: full diagnostics, OS-reported system figures, charts,
+        # the process list, then the details of whatever is selected.
+        with VerticalScroll(id="dashboard"):
+            device = Static("Sampling memory counters...", id="device")
+            device.border_title = "Memory"
+            yield device
+            system = Static("Sampling OS memory counters...", id="system")
+            system.border_title = "System · OS-reported"
+            yield system
+            with Vertical(id="history"):
+                with Horizontal(id="chart-controls"):
+                    yield Static("Charts", id="chart-label")
+                    yield Select([("All charts", -1), *((label, i) for i, (_k, label, _u) in enumerate(CHARTS))],
+                                 value=-1, allow_blank=False, compact=True, id="chart-mode")
+                    yield Static("  click to choose · c cycles", id="chart-hint")
+                yield Static(id="charts")
+                yield Static(id="chart-note")
+        yield DataTable(id="procs", cursor_type="row", zebra_stripes=True)
+        with VerticalScroll(id="inspector"):
+            yield Static(Text("Select a process (↑/↓ or click) to see what its memory is made of.  "
+                              "Press ? to learn what each number means.", style="grey62"), id="inspect-body")
         yield Input(placeholder="filter by name, runtime or PID   (Enter keeps it, Esc clears)", id="filter")
         yield Footer()
 
     def on_resize(self, event) -> None:
         self._apply_size(event.size.width, event.size.height)
+        if self.snapshot is not None:  # bars, columns and chart widths follow the terminal
+            self.call_after_refresh(self._render_dashboard)
+
+    def _render_dashboard(self) -> None:
+        if self.snapshot is None or not self.query("#device"):
+            return
+        self.render_top()
+        self.render_system()
+        self.render_charts()
 
     def _column_tier(self, width: int) -> int:
-        slim = self.screen.has_class("slim")
-        narrow = width < NARROW_W
-        table_w = width if (slim or narrow) else width - SIDE_W
+        table_w = width  # the table always gets the full width now
         if table_w >= FULL_COLS_W:
             return 0
         return 1 if table_w >= MID_COLS_W else 2 if table_w >= SMALL_COLS_W else 3
 
     def _apply_size(self, width: int, height: int) -> None:
-        self.screen.set_class(width < NARROW_W, "narrow")
         self.screen.set_class(height < SHORT_H, "short")
         compact = self._column_tier(width)
         if compact != self.compact_cols:
@@ -474,8 +500,8 @@ class MemTaskManApp(App):
     # ------------------------------------------------------------------ rendering
     def render_top(self) -> None:
         snap = self.snapshot
-        top = self.query_one("#top", Static)
-        width = max(20, top.size.width - 2 if top.size.width else 100)
+        top = self.query_one("#device", Static)
+        width = max(30, (top.size.width - 4) if top.size.width else self.size.width - 6)
         lines: list[Text] = []
         status = Text()
         status.append("memtaskman", style="bold")
@@ -511,20 +537,22 @@ class MemTaskManApp(App):
             line.append_text(stacked_bar(segs, sm.total, bar_w))
             line.append(f" {fmt_bytes(sm.used)}/{fmt_bytes(sm.total)} {pct(sm.used, sm.total):.0f}%")
             lines.append(line)
+            slim = self.screen.has_class("slim")
             legend = Text(" " * 7)
             for label, value, color in segs:
                 legend.append("■ ", style=color)
                 legend.append(f"{label} {fmt_bytes(value)}   ")
             if sm.compressed is not None:
                 legend.append(f"Compressed {fmt_bytes(sm.compressed)}   ", style="dim")
-            lines.append(legend)
+            if not slim:
+                lines.append(legend)
             if sm.commit_used is not None and sm.commit_limit:
                 line = Text(f"{'Commit':<7}")
                 line.append_text(stacked_bar([("c", sm.commit_used, C_COMMIT), ("r", sm.commit_limit - sm.commit_used, C_FREE)],
                                              sm.commit_limit, bar_w))
                 line.append(f" {fmt_bytes(sm.commit_used)}/{fmt_bytes(sm.commit_limit)} {pct(sm.commit_used, sm.commit_limit):.0f}%")
                 lines.append(line)
-            if sm.swap_total:
+            if sm.swap_total and not slim:
                 line = Text(f"{'Swap':<7}")
                 line.append_text(stacked_bar([("s", sm.swap_used or 0, C_SWAP), ("f", sm.swap_total - (sm.swap_used or 0), C_FREE)],
                                              sm.swap_total, bar_w))
@@ -532,89 +560,138 @@ class MemTaskManApp(App):
                 lines.append(line)
         top.update(Text("\n").join(lines))
 
+    def _chart_scale(self, key: str, values: list[float]) -> tuple[float, str]:
+        """Fixed axes, like gputaskman: a bar's height means the same thing every time."""
+        sm = self.snapshot.system if self.snapshot else None
+        total = float(sm.total) if sm else 0.0
+        if key in ("used", "cache", "compressed", "kernel", "wired"):
+            return total, f"0-{fmt_bytes(total)}"
+        if key == "commit":
+            return float(sm.commit_limit or total) if sm else 0.0, "0-commit limit"
+        if key == "swap":
+            return float(sm.swap_total or 0) if sm else 0.0, "0-swap size"
+        if key == "pressure":
+            return 100.0, "0-100%"
+        peak = max(values) if values else 0.0
+        return max(peak, 1.0), "auto"
+
     def render_charts(self) -> None:
-        for i, (key, label, kind) in enumerate(CHARTS):
-            data = list(self.history[key])
-            cell = self.query_one(f"#chart-{key}")
-            cell.display = self.chart_mode in (-1, i)
-            if not cell.display:
-                continue
-            cur = data[-1] if data else None
+        if not self.query("#charts"):
+            return
+        width = max(20, self.size.width - 6)
+        indices = list(range(len(CHARTS))) if self.chart_mode == -1 else [self.chart_mode]
+        columns = min(len(indices), 3, max(1, (width + 2) // 46))
+        cell_width = max(24, (width - 2 * (columns - 1)) // columns)
+        grid = Table.grid(padding=(0, 2), pad_edge=False, expand=True)
+        for _ in range(columns):
+            grid.add_column(width=cell_width, no_wrap=True, overflow="crop")
+        cells = []
+        for i in indices:
+            key, label, kind = CHARTS[i]
+            values = list(self.history[key])
+            cur = values[-1] if values else None
             if kind == "bytes":
                 val = fmt_bytes(cur)
-                rng = f"  [{fmt_bytes(min(data))}-{fmt_bytes(max(data))}]" if len(data) > 1 else ""
             elif kind == "pct":
                 val = f"{cur:.1f}%" if cur is not None else "-"
-                rng = f"  [peak {max(data):.1f}%]" if data else ""
             else:
                 val = fmt_count_rate(cur)
-                rng = f"  [peak {fmt_count_rate(max(data))}]" if data else ""
-            self.query_one(f"#label-{key}", Static).update(f"{label}: [b]{val}[/b][dim]{rng}[/dim]")
-            self.query_one(f"#spark-{key}", Sparkline).data = data or [0]
+            scale, _axis = self._chart_scale(key, values)
+            cell = Text(f"{label[:16]:<16} ", style=CHART_COLORS.get(key, ""))
+            cell.append(f"{val:>8} ", style="bold")
+            cell.append_text(spark(values, max(1, cell_width - 27), scale))
+            cells.append(cell)
+        for start in range(0, len(cells), columns):
+            row = cells[start:start + columns]
+            grid.add_row(*row, *([""] * (columns - len(row))))
+        self.query_one("#charts", Static).update(grid)
+        sm = self.snapshot.system if self.snapshot else None
+        axes = f"RAM charts 0-{fmt_bytes(sm.total)}" if sm else "RAM charts 0-total RAM"
+        self.query_one("#chart-note", Static).update(
+            f"Last {HISTORY} samples, newest on the right · blank = no reading · {axes} · "
+            "commit 0-limit · swap 0-size · fault rates auto-scaled")
 
     def render_system(self) -> None:
         sm = self.snapshot.system if self.snapshot else None
         w = self.query_one("#system", Static)
         if not sm:
-            w.update("[dim]system counters disabled[/dim]")
+            w.update(Text("system counters disabled (--no-system)", style="dim"))
             return
-        note = Text(sm.vm_note, style="yellow") if sm.vm_note else None
-        t = Table.grid(padding=(0, 1))
-        t.add_column(style="dim")
-        t.add_column(justify="right")
-        t.add_column(style="dim")
-        rows = [
-            ("Available", sm.available, "free + reclaimable cache"),
-            ("Modified" if WINDOWS else "Dirty", sm.modified, "waiting to be written"),
-            ("Standby" if WINDOWS else "Page cache", sm.standby if WINDOWS else sm.cached, "cached file data"),
-            ("Kernel paged" if WINDOWS else "Slab reclaim", sm.kernel_paged, ""),
-            ("Kernel nonpaged" if WINDOWS else "Slab unreclaim", sm.kernel_nonpaged, "can't be paged out"),
-            ("Compressed", sm.compressed, "compression store" if WINDOWS else "zswap pool"),
+        facts = [
+            ("Available", sm.available),
+            ("Modified" if WINDOWS else "Dirty", sm.modified),
+            ("Standby" if WINDOWS else "Page cache", sm.standby if WINDOWS else sm.cached),
+            ("Kernel paged" if WINDOWS else "Slab reclaim", sm.kernel_paged),
+            ("Kernel nonpaged" if WINDOWS else "Slab unreclaim", sm.kernel_nonpaged),
+            ("Compressed", sm.compressed),
+            *sm.extra.items(),
         ]
-        rows += [(k, v, "") for k, v in sm.extra.items()]
-        why = [(FIELD_LABELS.get(k, k), r) for k, r in sm.unavailable.items() if k != "page_faults_ps"]
-        for label, value, note in rows:
-            if value is not None:
-                t.add_row(label, fmt_bytes(value), note)
-        extra = []
+        facts = [(k, v) for k, v in facts if v is not None]
+        width = max(30, (w.size.width - 4) if w.size.width else self.size.width - 6)
+        cols = max(1, min(4, width // 42))
+        grid = Table.grid(padding=(0, 3), pad_edge=False)
+        for _ in range(cols):
+            grid.add_column(no_wrap=True, overflow="ellipsis")
+        rows_needed = (len(facts) + cols - 1) // cols
+        for r in range(rows_needed):
+            cells = []
+            for c in range(cols):
+                i = c * rows_needed + r  # fill down each column, like a newspaper
+                if i < len(facts):
+                    label, value = facts[i]
+                    cell = Text(f"{label[:30]:<30} ", style="grey62")
+                    cell.append(f"{fmt_bytes(value):>8}")
+                    cells.append(cell)
+                else:
+                    cells.append("")
+            grid.add_row(*cells)
+        lines: list = [grid]
+
+        def line(title: str) -> Text:
+            return Text(f"{title}  ", style="bold grey62")
+
+        for pf in sm.pagefiles or []:
+            t = line("Pagefile")
+            t.append(f"{pf['path']}  {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, peak {fmt_bytes(pf['peak'])}")
+            lines.append(t)
+        if sm.pagefiles == []:
+            lines.append(Text("No pagefile: the commit limit equals RAM", style="yellow"))
+        if sm.pool_tags:
+            t = line("Pool tags")
+            shown = sm.pool_tags[:6] + [r for r in sm.pool_tags[6:] if (r["growth_ps"] or 0) > 16 * 1024]
+            for r in shown:
+                t.append(f"{r['tag']} ", style="cyan")
+                t.append(f"{fmt_bytes(r['nonpaged'] + r['paged'])}")
+                g = r["growth_ps"]
+                if g is not None and abs(g) >= 1024:
+                    t.append(f" {'+' if g > 0 else '-'}{fmt_bytes(abs(g) * 60)}/min",
+                             style="bold red" if g > 64 * 1024 else "yellow" if g > 0 else "green")
+                t.append("   ")
+            lines.append(t)
         if sm.slab_top:
-            extra.append(Text("Kernel slab caches", style="bold dim"))
-            for r in sm.slab_top[:6]:
-                extra.append(Text(f"  {r['cache'][:22]:<22} {fmt_bytes(r['bytes']):>8}", style="dim"))
+            t = line("Slab")
+            t.append("   ".join(f"{r['cache']} {fmt_bytes(r['bytes'])}" for r in sm.slab_top[:6]))
+            lines.append(t)
         sh = sm.shared or {}
         if sh.get("tmpfs") or sh.get("sysv") or sh.get("files"):
-            extra.append(Text("RAM held outside processes", style="bold dim"))
-            for mnt in sh.get("tmpfs", [])[:4]:
-                extra.append(Text(f"  tmpfs {mnt['mount'][:20]:<20} {fmt_bytes(mnt['used']):>8}", style="dim"))
+            t = line("Outside processes")
+            bits = [f"tmpfs {m['mount']} {fmt_bytes(m['used'])}" for m in sh.get("tmpfs", [])[:3]]
             if sh.get("sysv"):
-                rss = sum(s["rss"] for s in sh["sysv"])
-                extra.append(Text(f"  SysV shm  {len(sh['sysv'])} segment(s), {fmt_bytes(rss)} resident", style="dim"))
+                bits.append(f"SysV {len(sh['sysv'])} seg {fmt_bytes(sum(x['rss'] for x in sh['sysv']))}")
             names = {p.pid: p.name for p in self.snapshot.processes} if self.snapshot else {}
-            for f in sh.get("files", [])[:4]:
-                who = ", ".join(sorted({names.get(h, str(h)) for h in f["holders"]}))[:30]
-                size = fmt_bytes(f["size"]) if f["size"] is not None else "?"
-                extra.append(Text(f"  {f['path'][:26]:<26} {size:>7}  {who}", style="dim"))
-        if sm.pool_tags:
-            extra.append(Text("Kernel pool by tag (nonpaged / paged, growth per min)", style="bold dim"))
-            for r in sm.pool_tags[:6] + [r for r in sm.pool_tags[6:] if (r["growth_ps"] or 0) > 16 * 1024]:
-                g = r["growth_ps"]
-                line = Text(f"  {r['tag']:<6}", style="cyan")
-                line.append(f"{fmt_bytes(r['nonpaged']):>8} {fmt_bytes(r['paged']):>8}")
-                if g is not None and abs(g) >= 1024:
-                    line.append(f"  {'+' if g > 0 else '-'}{fmt_bytes(abs(g) * 60)}/min",
-                                style="bold red" if g > 64 * 1024 else "yellow" if g > 0 else "green")
-                extra.append(line)
-        for pf in sm.pagefiles or []:
-            line = Text(f"Pagefile {pf['path']}", style="dim")
-            line.append(f"  {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, peak {fmt_bytes(pf['peak'])}")
-            extra.append(line)
-        if sm.pagefiles == []:
-            extra.append(Text("No pagefile: commit limit = RAM", style="yellow"))
+            for f in sh.get("files", [])[:3]:
+                who = ",".join(sorted({names.get(h, str(h)) for h in f["holders"]}))[:24]
+                bits.append(f"{f['path'].rsplit('/', 1)[-1]} {fmt_bytes(f['size']) if f['size'] is not None else '?'} ({who})")
+            t.append("   ".join(bits))
+            lines.append(t)
+        if sm.vm_note:
+            lines.append(Text(sm.vm_note, style="yellow"))
+        why = [(FIELD_LABELS.get(k, k), r) for k, r in sm.unavailable.items() if k != "page_faults_ps"]
         if why:
-            extra.append(Text("Unavailable", style="bold dim"))
-            for label, reason in why:
-                extra.append(Text(f"  {label}: {reason}", style="dim"))
-        w.update(Group(Text("System", style="bold"), t, *([note] if note else []), *extra))
+            t = line("n/a")
+            t.append(";  ".join(f"{label}: {reason}" for label, reason in why), style="grey50")
+            lines.append(t)
+        w.update(Group(*lines))
 
     def _ordered(self, snap: Snapshot) -> list[ProcessMem]:
         if self.group_mode == "cgroup" and snap.cgroups is not None:
@@ -734,6 +811,7 @@ class MemTaskManApp(App):
 
     @ui_callback
     def show_cgroup(self, row: ProcessMem) -> None:
+        self.query_one("#inspector").border_title = f"{row.name} - cgroup, {row.count} process(es)"
         parts: list = []
         head = Text()
         head.append(row.name, style="bold")
@@ -798,6 +876,8 @@ class MemTaskManApp(App):
     @ui_callback
     def show_inspection(self, ins: Inspection, group_count: int = 1) -> None:
         self.inspection = ins
+        title = f"{ins.name} (pid {ins.pid})" + (f" - largest of {group_count}" if group_count > 1 else "")
+        self.query_one("#inspector").border_title = title
         parts: list = []
         head = Text()
         head.append(f"{ins.name}", style="bold")
@@ -967,12 +1047,22 @@ class MemTaskManApp(App):
 
     def action_charts(self) -> None:
         self.chart_mode = self.chart_mode + 1 if self.chart_mode + 1 < len(CHARTS) else -1
-        self.query_one("#charts").set_class(self.chart_mode >= 0, "single")
-        self.render_charts()
+        sel = self.query_one("#chart-mode", Select)
+        if sel.value != self.chart_mode:
+            sel.value = self.chart_mode  # posts Select.Changed, which re-renders
+        else:
+            self.render_charts()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "chart-mode" and isinstance(event.value, int):
+            self.chart_mode = event.value
+            self.render_charts()
 
     def action_mode(self) -> None:
         self.screen.toggle_class("slim")
-        self._apply_size(self.size.width, self.size.height)  # slim frees the side panel's width
+        self._apply_size(self.size.width, self.size.height)
+        if self.snapshot is not None:
+            self.render_top()
 
     def action_pause(self) -> None:
         self.paused = not self.paused
