@@ -34,6 +34,19 @@ RUNTIME_TTL = 45.0  # seconds before re-checking a process's loaded modules
 PSS_TTL = 2.0  # smaps_rollup makes the kernel walk page tables; refresh visible rows at most this often
 
 
+def unique_column() -> tuple[str, str] | None:
+    """(header, ProcessMem attribute) of the per-platform "real RAM" column, if any.
+
+    Linux: PSS (shared pages split between sharers). Windows: private working set
+    (Task Manager's "Memory" column). Both avoid counting shared pages in full.
+    """
+    if LINUX:
+        return ("PSS", "pss")
+    if WINDOWS:
+        return ("PrivWS", "uss")
+    return None
+
+
 def private_label() -> str:
     if WINDOWS:
         return "Private"  # private commit charge (Task Manager "Commit size")
@@ -62,6 +75,7 @@ class Collector:
     def __init__(self, system: bool = True):
         self.want_system = system
         self._pdh = native.PdhQuery() if WINDOWS and system else None
+        self._pws = native.PrivateWorkingSet() if WINDOWS else None
         self._tracks: dict[tuple[int, float], _Track] = {}
         self._runtimes: dict[tuple[int, float], _RuntimeEntry] = {}
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
@@ -92,6 +106,7 @@ class Collector:
     def _processes(self, now: float) -> list[ProcessMem]:
         out: list[ProcessMem] = []
         seen = set()
+        private_ws = self._pws.sample() if self._pws else {}
         for proc in psutil.process_iter(["pid", "name", "ppid", "create_time", "memory_info"]):
             info = proc.info
             mi = info.get("memory_info")
@@ -114,6 +129,7 @@ class Collector:
                 p.paged_pool = getattr(mi, "paged_pool", None)
                 p.nonpaged_pool = getattr(mi, "nonpaged_pool", None)
                 faults = getattr(mi, "num_page_faults", None)
+                p.uss = private_ws.get(pid)
             elif LINUX:
                 st = native.proc_status(pid)
                 if "RssAnon" in st:
@@ -178,6 +194,12 @@ class Collector:
             sb = [c.get(k) for k in ("standby_core", "standby_normal", "standby_reserve")]
             if any(v is not None for v in sb):
                 sm.standby = int(sum(v or 0 for v in sb))
+                # Reuse order when RAM is needed: reserve first, then normal, core last.
+                for key, label in (("standby_reserve", "Standby: reserve (reused 1st)"),
+                                   ("standby_normal", "Standby: normal (reused 2nd)"),
+                                   ("standby_core", "Standby: core (reused last)")):
+                    if c.get(key) is not None:
+                        sm.extra[label] = int(c[key])
             if "modified" in c:
                 sm.modified = int(c["modified"])
             if "free_zero" in c:
@@ -321,6 +343,8 @@ class Collector:
     def close(self) -> None:
         if self._pdh:
             self._pdh.close()
+        if self._pws:
+            self._pws.close()
 
 
 # ---------------------------------------------------------------------- aggregation
@@ -372,6 +396,7 @@ SORTS = {
     "resident": lambda p: p.resident,
     "private": lambda p: p.private or 0,
     "pss": lambda p: p.pss or 0,
+    "uss": lambda p: p.uss or 0,
     "growth": lambda p: p.growth_ps or 0,
     "faults": lambda p: p.faults_ps or 0,
     "name": lambda p: p.name.lower(),

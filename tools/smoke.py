@@ -44,6 +44,10 @@ def collector_checks() -> None:
         check(me.private is not None, "own private bytes reported")
     if WINDOWS:
         check(sm.standby is not None and sm.modified is not None, "standby/modified lists via PDH")
+        check(any(k.startswith("Standby: ") for k in sm.extra), "standby split by priority")
+        with_ws = sum(1 for p in snap.processes if p.uss is not None)
+        check(me.uss is not None and 0 < me.uss <= me.resident, "own private working set via PDH")
+        check(with_ws > len(snap.processes) // 2, f"private working set for {with_ws}/{len(snap.processes)} processes")
     n = c.resolve_runtimes(sort_procs(snap.processes, "resident")[:30], time_budget=5.0)
     check(n > 0, f"runtime identification ran for {n} processes")
     if LINUX:

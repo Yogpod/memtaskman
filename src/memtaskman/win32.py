@@ -198,6 +198,91 @@ class PdhQuery:
             self.handle = None
 
 
+class PDH_FMT_COUNTERVALUE_ITEM_W(ctypes.Structure):
+    _fields_ = [("szName", wt.LPWSTR), ("FmtValue", PDH_FMT_COUNTERVALUE)]
+
+
+PDH_FMT_LARGE = 0x00000400
+PDH_MORE_DATA = 0x800007D2
+pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_ulong
+pdh.PdhGetFormattedCounterArrayW.argtypes = [wt.HANDLE, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+
+
+def _counter_array(counter, fmt: int = PDH_FMT_LARGE) -> dict[str, int]:
+    """Instance name -> value for a wildcard counter."""
+    size, count = wt.DWORD(0), wt.DWORD(0)
+    status = pdh.PdhGetFormattedCounterArrayW(counter, fmt, ctypes.byref(size), ctypes.byref(count), None)
+    if status != PDH_MORE_DATA or not size.value:
+        return {}
+    buf = ctypes.create_string_buffer(size.value)
+    if pdh.PdhGetFormattedCounterArrayW(counter, fmt, ctypes.byref(size), ctypes.byref(count), buf) != 0:
+        return {}
+    items = ctypes.cast(buf, ctypes.POINTER(PDH_FMT_COUNTERVALUE_ITEM_W))
+    out = {}
+    for i in range(count.value):
+        item = items[i]
+        if item.FmtValue.CStatus in (0, 1):  # PDH_CSTATUS_VALID_DATA / NEW_DATA
+            out[item.szName] = item.FmtValue.u.largeValue
+    return out
+
+
+class PrivateWorkingSet:
+    """Private working set (Task Manager's "Memory" column) for every process in one query.
+
+    Prefers the ``Process V2`` counter set (Windows 11 / Server 2022+), whose instances are
+    named ``name:pid``. Falls back to the classic ``Process`` set, pairing instances with
+    ``ID Process`` because its names are ambiguous (``chrome#12``).
+    """
+
+    def __init__(self):
+        self.handle = wt.HANDLE()
+        self.v2 = False
+        self.ws = self.ids = None
+        if pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.handle)) != 0:
+            self.handle = None
+            return
+        h = wt.HANDLE()
+        if pdh.PdhAddEnglishCounterW(self.handle, r"\Process V2(*)\Working Set - Private", 0, ctypes.byref(h)) == 0:
+            self.ws, self.v2 = h, True
+        else:
+            h2 = wt.HANDLE()
+            ok1 = pdh.PdhAddEnglishCounterW(self.handle, r"\Process(*)\Working Set - Private", 0, ctypes.byref(h)) == 0
+            ok2 = pdh.PdhAddEnglishCounterW(self.handle, r"\Process(*)\ID Process", 0, ctypes.byref(h2)) == 0
+            if ok1 and ok2:
+                self.ws, self.ids = h, h2
+        if self.ws is None:
+            self.close()
+
+    @property
+    def source(self) -> str:
+        return r"\Process V2(*)" if self.v2 else r"\Process(*)"
+
+    def sample(self) -> dict[int, int]:
+        """PID -> private working set bytes. Empty when unavailable."""
+        if not self.handle or pdh.PdhCollectQueryData(self.handle) != 0:
+            return {}
+        values = _counter_array(self.ws)
+        out: dict[int, int] = {}
+        if self.v2:
+            for name, v in values.items():
+                _, sep, pid = name.rpartition(":")
+                if sep and pid.isdigit():
+                    out[int(pid)] = v
+        else:
+            ids = _counter_array(self.ids)
+            for name, v in values.items():
+                pid = ids.get(name)
+                if pid is not None and name != "_Total":
+                    out[int(pid)] = v
+        out.pop(0, None)  # Idle / _Total
+        return out
+
+    def close(self) -> None:
+        if self.handle:
+            pdh.PdhCloseQuery(self.handle)
+            self.handle = None
+
+
 # --------------------------------------------------------------------------- processes
 
 

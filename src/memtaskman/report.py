@@ -47,12 +47,15 @@ def render_text(snap: Snapshot, *, top: int | None = 25) -> str:
     if top:
         procs = procs[:top]
     pl = snap.private_label
-    has_pss = any(p.pss is not None for p in procs)
-    pss_h = f" {'PSS':>9}" if has_pss else ""
+    from memtaskman.collector import unique_column
+
+    uniq = unique_column()
+    has_pss = uniq is not None and any(getattr(p, uniq[1]) is not None for p in procs)
+    pss_h = f" {uniq[0]:>9}" if has_pss else ""
     out.append(f"{'PID':>7}  {'Name':<28} {'Resident':>9}{pss_h} {pl:>9} {'Growth':>10} {'Faults/s':>8}  Runtime")
     for p in procs:
         rt = f"{p.runtime or ''} {p.runtime_detail or ''}".strip()
-        pss = f" {fmt_bytes(p.pss):>9}" if has_pss else ""
+        pss = f" {fmt_bytes(getattr(p, uniq[1])):>9}" if has_pss else ""
         out.append(
             f"{p.pid:>7}  {p.name[:28]:<28} {fmt_bytes(p.resident):>9}{pss} {fmt_bytes(p.private):>9} "
             f"{fmt_rate(p.growth_ps):>10} {fmt_count_rate(p.faults_ps):>8}  {rt}"

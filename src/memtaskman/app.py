@@ -16,7 +16,9 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Sparkline, Static
 
-from memtaskman.collector import LINUX, WINDOWS, Collector, group_by_app, sort_procs
+from memtaskman.collector import WINDOWS, Collector, group_by_app, sort_procs, unique_column
+
+UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct
 from memtaskman.model import DERIVED, HINT, IDENTIFIED, MEASURED, Inspection, ProcessMem, Snapshot, SystemMemory
 
@@ -61,6 +63,8 @@ HELP = f"""\
   Anon        Linux: resident anonymous memory (RssAnon)
   PSS         Linux: resident, with each shared page split between its sharers; sums to real RAM use
               (read from smaps_rollup for visible rows; blank for other users' processes unless run as root)
+  PrivWS      Windows: private working set, Task Manager's "Memory" column. Pages only this process
+              can use; slightly below tools that count shared-but-unshared pages as unique
   Growth      smoothed change of Private per second — a steadily positive value is how leaks look
   Faults/s    page faults per second (soft + hard)
   Pool/Swap   Windows: kernel pool charged to the process / Linux: swapped-out bytes
@@ -149,7 +153,7 @@ class MemTaskManApp(App):
         self.interval = max(0.25, interval)
         self.collector = Collector(system=system)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
-        self.sort_keys = ["resident"] + (["pss"] if LINUX else []) + ["private", "growth", "faults", "name", "pid"]
+        self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
         self.show_all = False
         self.grouped = False
@@ -191,8 +195,8 @@ class MemTaskManApp(App):
         t.add_column(first, key="pid", width=7)
         t.add_column("Name", key="name", width=26)
         t.add_column("Resident", key="resident", width=9)
-        if LINUX:
-            t.add_column("PSS", key="pss", width=9)
+        if UNIQUE:
+            t.add_column(UNIQUE[0], key=UNIQUE[1], width=9)
         t.add_column(pl, key="private", width=9)
         t.add_column("Growth", key="growth", width=10)
         t.add_column("Faults/s", key="faults", width=8)
@@ -364,8 +368,8 @@ class MemTaskManApp(App):
                 p.name,
                 Text(fmt_bytes(p.resident), justify="right"),
             ]
-            if LINUX:
-                cells.append(Text(fmt_bytes(p.pss), justify="right"))
+            if UNIQUE:
+                cells.append(Text(fmt_bytes(getattr(p, UNIQUE[1])), justify="right"))
             t.add_row(
                 *cells,
                 Text(fmt_bytes(p.private), justify="right"),
