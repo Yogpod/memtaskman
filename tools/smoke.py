@@ -53,6 +53,10 @@ def collector_checks() -> None:
     if WINDOWS:
         check(sm.standby is not None and sm.modified is not None, "standby/modified lists via PDH")
         check(any(k.startswith("Standby: ") for k in sm.extra), "standby split by priority")
+        check(sm.pagefiles is not None and all(pf["size"] >= pf["used"] for pf in sm.pagefiles),
+              f"pagefiles: {[pf['path'] for pf in sm.pagefiles or []]}")
+        check(sm.low_memory is not None, f"low-memory notification readable ({sm.low_memory})")
+        check(bool(sm.pool_tags), f"kernel pool tags: {len(sm.pool_tags or [])} rows")
         with_ws = sum(1 for p in snap.processes if p.uss is not None)
         check(me.uss is not None and 0 < me.uss <= me.resident, "own private working set via PDH")
         check(with_ws > len(snap.processes) // 2, f"private working set for {with_ws}/{len(snap.processes)} processes")
@@ -60,6 +64,8 @@ def collector_checks() -> None:
     check(n > 0, f"runtime identification ran for {n} processes")
     if LINUX:
         check(sm.pressure_some is not None, f"memory pressure (PSI) some={sm.pressure_some}")
+        check(sm.oom_kills is not None, f"OOM kills since boot: {sm.oom_kills}")
+        check(sm.shared is not None and "tmpfs" in sm.shared, "tmpfs / SysV / shm-file accounting")
         check(bool(snap.cgroups), f"{len(snap.cgroups or [])} cgroup rows")
         mine = next((g for g in snap.cgroups or [] if g.cgroup == me.cgroup), None)
         check(mine is not None and mine.count >= 1, f"own cgroup row: {mine and mine.name}")
@@ -111,6 +117,28 @@ async def tui_checks() -> None:
         await pilot.press("escape")
         await pilot.pause(0.3)
         check(app.screen is not None, "help screen opens and closes")
+        app.on_data_table_header_selected(type("E", (), {"column_key": type("K", (), {"value": "name"})()})())
+        await pilot.pause(0.3)
+        first = [p.name.lower() for p in list(app.rows.values())[:5]]
+        check(app.sort_key == "name" and first == sorted(first), "header click sorts by name")
+        app.on_data_table_header_selected(type("E", (), {"column_key": type("K", (), {"value": "name"})()})())
+        await pilot.pause(0.3)
+        check(app.sort_invert, "second header click reverses")
+        app.sort_key, app.sort_invert = "resident", False
+        await pilot.press("t")
+        await pilot.pause(1.0)
+        tree_ok = bool(app.tree_rows) and any(r.depth > 0 for r in app.tree_rows.values())
+        check(tree_ok, f"tree view: {len(app.tree_rows)} rows with nesting")
+        parent = next((k for k, r in app.tree_rows.items() if r.children), None)
+        if parent:
+            was = app.tree_rows[parent].collapsed
+            table = app.query_one("#procs")
+            table.move_cursor(row=list(app.rows).index(parent))
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+            check(parent in app.tree_rows and app.tree_rows[parent].collapsed != was, "Enter toggles a tree node")
+        await pilot.press("t")
+        await pilot.pause(0.5)
         target = app.snapshot.processes[0].name[:4]
         await pilot.press("slash", *list(target.lower()))
         await pilot.pause(0.5)

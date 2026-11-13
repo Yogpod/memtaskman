@@ -98,6 +98,11 @@ class Collector:
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
         self._cg_tracks: dict[str, _Track] = {}
+        self._oom_start: int | None = None
+        self._shm_at = 0.0
+        self._shm_cache: dict | None = None
+        self._last_pids: list[int] = []
+        self._pool_hist: deque = deque(maxlen=7)  # (time, {tag: total}) every ~10 s: ~1 minute window
         self._pss_why: dict[tuple[int, float], str] = {}
         self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
         self._leaks: dict[tuple[int, float], leaks.Trend] = {}
@@ -241,6 +246,7 @@ class Collector:
 
     # ------------------------------------------------------------------ system
     def _system(self, now: float, procs: list[ProcessMem]) -> SystemMemory:
+        self._last_pids = [p.pid for p in sorted(procs, key=lambda p: -p.resident)]  # shm holder scan order
         vm = psutil.virtual_memory()
         sm = SystemMemory(total=vm.total, available=vm.available, used=vm.total - vm.available)
         try:
@@ -266,6 +272,8 @@ class Collector:
         if sm.page_faults_ps is None:
             why["page_faults_ps"] = WHY_NEEDS_TWO
         if WINDOWS:
+            if sm.pool_tags is None:
+                why["pool_tags"] = "pool tag query refused (some locked-down systems require admin)"
             if self._pdh is None or not self._pdh.counters:
                 why["standby"] = "PDH memory counters unavailable (disabled or corrupted: lodctr /r)"
             if sm.compressed is None:
@@ -274,7 +282,9 @@ class Collector:
             if sm.pressure_some is None:
                 why["pressure_some"] = "kernel without PSI (CONFIG_PSI off or psi=0 boot option)"
             if sm.compressed is None:
-                why["compressed"] = "zswap not enabled"
+                why["compressed"] = "neither zswap nor zram is enabled"
+            if sm.slab_top is None:
+                why["slab_top"] = "per-cache slab sizes need root (/proc/slabinfo)"
             if not sm.swap_total:
                 why["swap_total"] = "no swap configured"
         elif MACOS:
@@ -324,7 +334,34 @@ class Collector:
         comp = next((p for p in procs if p.name.lower() in ("memory compression", "memcompression")), None)
         if comp is not None:
             sm.compressed = comp.resident
+        sm.pagefiles = native.pagefiles()
+        sm.low_memory = native.low_memory()
+        sm.pool_tags = self._pool_tags()
         self._first = False
+
+    def _pool_tags(self, top: int = 20) -> list[dict] | None:
+        tags = native.pool_tags()
+        if tags is None:
+            return None
+        now = time.time()
+        totals = {k: v[0] + v[1] for k, v in tags.items()}
+        if not self._pool_hist or now - self._pool_hist[-1][0] >= 10:
+            self._pool_hist.append((now, totals))
+        t0, old = self._pool_hist[0]
+        dt = now - t0
+        rows = []
+        for k, (np_, pg) in sorted(tags.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:top]:
+            growth = (totals[k] - old.get(k, 0)) / dt if dt >= 20 else None
+            rows.append({"tag": k, "nonpaged": np_, "paged": pg, "growth_ps": growth})
+        # Fast growers outside the top list are what leak hunts look for: include them too.
+        if dt >= 20:
+            names = {r["tag"] for r in rows}
+            growers = sorted(((k, (totals[k] - old.get(k, 0)) / dt) for k in totals if k not in names),
+                             key=lambda kv: -kv[1])[:5]
+            for k, g in growers:
+                if g > 16 * 1024:  # > 16 KiB/s sustained over a minute
+                    rows.append({"tag": k, "nonpaged": tags[k][0], "paged": tags[k][1], "growth_ps": g})
+        return rows
 
     def _system_macos(self, sm: SystemMemory, now: float) -> None:
         sm.source = "host_statistics64 + sysctl"
@@ -352,6 +389,15 @@ class Collector:
                 sm.hard_faults_ps = (v["pageins"] - prev["pageins"]) / dt
         self._vm_prev = (now, v)
 
+    def _shared_memory(self) -> dict:
+        """RAM held by tmpfs, SysV segments and shared files: memory no single process owns."""
+        holders = native.shared_memory_holders(self._last_pids)
+        sizes = native.shm_file_sizes(list(holders))
+        files = sorted(({"path": p, "size": sizes.get(p), "holders": sorted(h)} for p, h in holders.items()),
+                       key=lambda f: -(f["size"] or 0))
+        sysv = native.sysv_shm()
+        return {"tmpfs": [t for t in native.tmpfs_usage() if t["used"]], "sysv": sysv, "files": files[:20]}
+
     def _system_linux(self, sm: SystemMemory, now: float) -> None:
         sm.source = "/proc/meminfo + /proc/vmstat"
         if native.is_wsl():
@@ -360,6 +406,22 @@ class Collector:
         sm.free = mi.get("MemFree")
         sm.cached = mi.get("Cached", 0) + mi.get("Buffers", 0) if "Cached" in mi else None
         sm.compressed = mi.get("Zswap")
+        page = native.page_size()
+        zr = native.zram()
+        if zr:
+            sm.compressed = (sm.compressed or 0) + zr["used"]
+            sm.extra["zram (original data)"] = zr["original"]
+            sm.extra["zram (RAM used)"] = zr["used"]
+        ks = native.ksm(page)
+        if ks and ks["saved"]:
+            sm.extra["KSM merged (saved)"] = ks["saved"]
+        if mi.get("HugePages_Total"):
+            sm.extra["Hugetlb pages (reserved)"] = mi.get("Hugetlb") or mi["HugePages_Total"] * mi.get("Hugepagesize", 0)
+        sm.slab_top = [{"cache": n, "bytes": b, "objects": o} for n, b, o in native.slab_top(page) or []] or None
+        if now - self._shm_at >= 10 or self._shm_cache is None:
+            self._shm_at = now
+            self._shm_cache = self._shared_memory()
+        sm.shared = self._shm_cache
         sm.commit_used = mi.get("Committed_AS")
         sm.commit_limit = mi.get("CommitLimit")
         sm.kernel_paged = mi.get("SReclaimable")
@@ -382,6 +444,11 @@ class Collector:
                 sm.page_faults_ps = (vs["pgfault"] - prev["pgfault"]) / dt
                 sm.hard_faults_ps = (vs.get("pgmajfault", 0) - prev.get("pgmajfault", 0)) / dt
         self._vm_prev = (now, vs)
+        if "oom_kill" in vs:
+            sm.oom_kills = vs["oom_kill"]
+            if self._oom_start is None:
+                self._oom_start = vs["oom_kill"]
+            sm.oom_kills_new = vs["oom_kill"] - self._oom_start
 
     def _update_leaks(self, now: float) -> None:
         if now - self._leaks_at < LEAK_EVERY:
@@ -527,6 +594,8 @@ class Collector:
         if self.wsl_guest and rt.stem(p.name) in ("vmmemwsl", "vmmem"):
             self._add_wsl_guest(ins, p)
         self._add_models(ins, p)
+        if WINDOWS:
+            self._add_policy(ins, p)
         ins.categories.sort(key=lambda c: CATEGORY_ORDER.index(c.name) if c.name in CATEGORY_ORDER else 99)
         with self._lock:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
@@ -575,6 +644,21 @@ class Collector:
         if cache:
             ins.evidence.append((HINT, f"free {fmt_bytes(cache)} of cache now: "
                                        "wsl -u root -e sh -c \"echo 1 > /proc/sys/vm/drop_caches\""))
+
+    def _add_policy(self, ins: Inspection, p: ProcessMem) -> None:
+        pol = native.process_policy(p.pid)
+        if not pol:
+            return
+        mp = pol.get("memory_priority")
+        if mp is not None:
+            note = "" if mp == 5 else ": its pages go to lower-priority standby and are reused sooner"
+            ins.evidence.append((MEASURED, f"memory priority {mp} ({native.MEMORY_PRIORITIES.get(mp, '?')}){note}"))
+        if pol.get("ecoqos"):
+            mode = "Efficiency mode" if pol.get("idle_priority") else "EcoQoS"
+            ins.evidence.append((MEASURED, f"{mode} on: throttled for power efficiency"))
+        if pol.get("in_job"):
+            ins.evidence.append((MEASURED, "runs inside a job object (its memory limits, if any, are only "
+                                           "readable by the job's owner)"))
 
     def _add_models(self, ins: Inspection, p: ProcessMem) -> None:
         """Name memory-mapped model files and, for Ollama, report its RAM / VRAM split."""
@@ -663,7 +747,11 @@ SORTS = {
     "faults": lambda p: p.faults_ps or 0,
     "name": lambda p: p.name.lower(),
     "pid": lambda p: p.pid,
+    "count": lambda p: p.count,
+    "extra": lambda p: ((p.paged_pool or 0) + (p.nonpaged_pool or 0)) if p.paged_pool is not None else (p.swapped or 0),
+    "runtime": lambda p: (p.runtime is None, f"{p.runtime or ''} {p.runtime_detail or ''}".lower()),
 }
+ASCENDING = {"name", "pid", "runtime"}  # natural order is A-Z / low-high; everything else largest first
 
 
 def _other_user(pid: int) -> bool:
@@ -685,5 +773,7 @@ def matches(p: ProcessMem, text: str) -> bool:
     return t in p.name.lower() or t in f"{p.runtime or ''} {p.runtime_detail or ''}".lower()
 
 
-def sort_procs(procs: list[ProcessMem], key: str) -> list[ProcessMem]:
-    return sorted(procs, key=SORTS[key], reverse=key not in ("name", "pid"))
+def sort_procs(procs: list[ProcessMem], key: str, invert: bool = False) -> list[ProcessMem]:
+    """Sort by a SORTS key in its natural direction; invert=True flips it."""
+    descending = key not in ASCENDING
+    return sorted(procs, key=SORTS[key], reverse=descending != invert)

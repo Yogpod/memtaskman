@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, units_legend
 from memtaskman.model import Inspection, Snapshot, SystemMemory
 
 
@@ -35,6 +35,24 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Faults   {fmt_count_rate(sm.page_faults_ps)}/s, hard {fmt_count_rate(sm.hard_faults_ps)}/s")
     for k, v in sm.extra.items():
         lines.append(f"         {k}: {fmt_bytes(v)}")
+    if sm.oom_kills is not None:
+        lines.append(f"OOM      {sm.oom_kills} kill(s) since boot")
+    if sm.slab_top:
+        lines.append("Slab     " + ", ".join(f"{r['cache']} {fmt_bytes(r['bytes'])}" for r in sm.slab_top[:5]))
+    if sm.shared and (sm.shared.get("tmpfs") or sm.shared.get("sysv")):
+        tm = ", ".join(f"{t['mount']} {fmt_bytes(t['used'])}" for t in sm.shared.get("tmpfs", [])[:4])
+        sv = sum(s["rss"] for s in sm.shared.get("sysv", []))
+        lines.append(f"Shared   tmpfs: {tm or '-'}; SysV shm: {len(sm.shared.get('sysv', []))} segment(s), {fmt_bytes(sv)}")
+    if sm.pool_tags:
+        lines.append("Pool     top tags (nonpaged / paged): " + ", ".join(
+            f"{r['tag']} {fmt_bytes(r['nonpaged'])}/{fmt_bytes(r['paged'])}" for r in sm.pool_tags[:6]))
+    for pf in sm.pagefiles or []:
+        lines.append(f"Pagefile {pf['path']}: {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, "
+                     f"peak {fmt_bytes(pf['peak'])}")
+    if sm.low_memory:
+        lines.append("LOW MEMORY (Windows LowMemoryResourceNotification is signalled)")
+    if sm.commit_used and sm.commit_limit and sm.commit_used >= 0.9 * sm.commit_limit:
+        lines.append(f"WARNING  commit charge at {100 * sm.commit_used / sm.commit_limit:.0f}% of the limit")
     if sm.pressure_level:
         lines.append(f"Pressure {sm.pressure_level}")
     if sm.pressure_some is not None:
@@ -48,7 +66,7 @@ def system_lines(sm: SystemMemory) -> list[str]:
 
 
 def render_text(snap: Snapshot, *, top: int | None = 25) -> str:
-    out: list[str] = []
+    out: list[str] = [f"Sizes: {units_legend()}"]
     if snap.system:
         out += system_lines(snap.system)
         out.append("")

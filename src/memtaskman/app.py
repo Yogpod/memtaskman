@@ -17,10 +17,23 @@ from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Sparkline, Static
 
-from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, matches, sort_procs, unique_column
+from memtaskman.collector import (
+    ASCENDING,
+    LINUX,
+    MACOS,
+    SORTS,
+    WINDOWS,
+    Collector,
+    group_by_app,
+    matches,
+    sort_procs,
+    unique_column,
+)
 
 UNIQUE = unique_column()
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
+from memtaskman import killer
+from memtaskman import tree as ptree
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact, set_units, units, units_legend
 from memtaskman.model import (
     DERIVED,
     FIELD_LABELS,
@@ -78,6 +91,7 @@ HELP = f"""\
   [{C_STANDBY}]■ Standby/cache[/]  file cache; instantly reusable, so it is "available"
   [{C_FREE}]■ Free[/]       zeroed / free pages (Linux: MemFree)
   Commit      memory promised to processes (RAM + pagefile); hitting the limit = out of memory
+              (status line warns above 90%; LOW MEMORY = Windows' own low-memory signal)
   Compressed  Windows compression store / Linux zswap pool
 
 [b]Process columns[/b]
@@ -119,7 +133,17 @@ HELP = f"""\
 [b]Memory pressure[/b] (Linux PSI) % of the last 10 s in which some / all tasks were stalled
   waiting for memory. A better out-of-memory signal than % used, since page cache fills RAM on purpose.
 
-[b]Keys[/b]  ↑/↓ select  / filter  s sort  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Units[/b] sizes use binary units by default (1G = 1 GiB = 1024³ bytes), like the OS counters.
+  u switches to decimal (1G = 1 GB = 10⁹ bytes), as used by Explorer and disk vendors.
+
+[b]Tree[/b] (t) parents with their children. Enter collapses / expands a node; a collapsed node shows
+  its subtree's totals (+N = hidden descendants). Nodes with many children start collapsed.
+
+[b]Ending processes[/b] (k) type the name to confirm. The first k asks politely (like closing its
+  windows / SIGTERM); if it's still running, k again force-kills it after a second confirmation.
+  Critical system processes are refused; --read-only (or read_only = true) disables k entirely.
+
+[b]Keys[/b]  k end process  t tree  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -143,6 +167,38 @@ def ui_callback(method):
             raise
 
     return wrapper
+
+
+class KillScreen(ModalScreen):
+    """Type the process name to confirm. Returns True / False via dismiss."""
+
+    AUTO_FOCUS = "#kill-name"
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, proc: ProcessMem, force: bool):
+        super().__init__()
+        self.proc = proc
+        self.force = force
+
+    def compose(self) -> ComposeResult:
+        p = self.proc
+        verb = "FORCE-KILL" if self.force else "End"
+        how = ("It gets no chance to save anything (TerminateProcess / SIGKILL)." if self.force else
+               "It is asked to close, as if you closed its windows (taskkill without /F / SIGTERM).")
+        with Vertical(id="kill"):
+            yield Static(f"[b]{verb} {p.name}[/b]  (pid {p.pid}, {fmt_bytes(p.resident)} resident)\n\n{how}\n\n"
+                         f"Type [b]{p.name}[/b] and press Enter to confirm, or Esc to cancel.")
+            yield Input(placeholder=p.name, id="kill-name")
+            yield Static("", id="kill-error")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.value.strip().lower() == self.proc.name.lower():
+            self.dismiss(True)
+        else:
+            self.query_one("#kill-error", Static).update(Text("name doesn't match", style="red"))
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class HelpScreen(ModalScreen):
@@ -212,6 +268,9 @@ class MemTaskManApp(App):
     #filter { display: none; height: 3; margin: 0 1; }
     #filter.visible { display: block; }
     HelpScreen { align: center middle; }
+    KillScreen { align: center middle; }
+    #kill { width: 76; max-width: 95%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
+    #kill-error { height: 1; }
     #help { width: 100; max-width: 95%; height: 80%; border: round $accent; background: $surface; padding: 1 2; }
     """
     BINDINGS = [
@@ -223,21 +282,39 @@ class MemTaskManApp(App):
         Binding("m", "mode", "Slim"),
         Binding("p", "pause", "Pause"),
         Binding("slash", "filter", "Filter", key_display="/"),
+        Binding("u", "units", "Units", show=False),
+        Binding("t", "tree", "Tree"),
+        Binding("k", "kill", "End process"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
 
     def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
-                 privacy: bool = False):
+                 privacy: bool = False, settings: dict | None = None):
         super().__init__()
+        settings = settings or {}
         self.privacy = privacy  # hide command lines and home-directory paths (screenshots, demos)
         self.interval = max(0.25, interval)
         self.collector = Collector(system=system, wsl_guest=wsl_guest)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
         self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
-        self.show_all = False
-        self.group_mode = "none"  # none | app | cgroup (Linux)
+        if settings.get("sort") in self.sort_keys:
+            self.sort_key = settings["sort"]
+        self.sort_invert = False  # second click on the same header reverses the order
+        self.tree_mode = bool(settings.get("tree", False))
+        self.top_n = int(settings.get("top", TOP_N))
+        self.start_slim = bool(settings.get("slim", False))
+        self.read_only = bool(settings.get("read_only", False))
+        self.polite_sent: dict[tuple, float] = {}  # process key -> when a polite close was requested
+        self.tree_collapsed: set = set()  # explicit user choices, by process key
+        self.tree_expanded: set = set()
+        self.tree_rows: dict[str, ptree.TreeRow] = {}
+        self.col_labels: dict[str, str] = {}
+        self.show_all = bool(settings.get("all", False))
+        self.group_mode = settings.get("group", "none")  # none | app | cgroup (Linux)
+        if self.group_mode not in GROUP_MODES:
+            self.group_mode = "none"
         self.filter_text = ""
         self.compact_cols = 0  # column tier, see _column_tier
         self.paused = False
@@ -292,6 +369,8 @@ class MemTaskManApp(App):
                 self.render_table()
 
     def on_mount(self) -> None:
+        if self.start_slim:
+            self.screen.add_class("slim")
         self.compact_cols = self._column_tier(self.size.width)
         self._apply_size(self.size.width, self.size.height)
         self._setup_columns()
@@ -315,6 +394,33 @@ class MemTaskManApp(App):
             t.add_column("Faults/s", key="faults", width=8)
             t.add_column(last, key="extra", width=7)
         t.add_column("Runtime", key="runtime", width=(24, 18, 14, 14)[self.compact_cols])
+        self.col_labels = {str(k.value): str(c.label) for k, c in t.columns.items()}
+        self._update_header_arrows()
+
+    def _sort_for_column(self, column_key: str) -> str:
+        return "count" if column_key == "pid" and self.grouped else column_key
+
+    def _update_header_arrows(self) -> None:
+        t = self.query_one("#procs", DataTable)
+        descending = (self.sort_key not in ASCENDING) != self.sort_invert
+        for key, col in t.columns.items():
+            base = self.col_labels.get(str(key.value), str(col.label))
+            if self._sort_for_column(str(key.value)) == self.sort_key:
+                col.label = Text(f"{base} {'▼' if descending else '▲'}", style="bold")
+            else:
+                col.label = Text(base)
+        t.refresh()
+
+    def on_data_table_header_selected(self, event: DataTable.HeaderSelected) -> None:
+        key = self._sort_for_column(str(event.column_key.value))
+        if key not in SORTS:
+            return
+        if key == self.sort_key:
+            self.sort_invert = not self.sort_invert
+        else:
+            self.sort_key, self.sort_invert = key, False
+        self._update_header_arrows()
+        self._refresh_now()
 
     def collector_private_label(self) -> str:
         from memtaskman.collector import private_label
@@ -329,9 +435,9 @@ class MemTaskManApp(App):
     @work(thread=True, exclusive=True, group="sample")
     def sample(self) -> None:
         snap = self.collector.sample()
-        visible = sort_procs(snap.processes, "resident")[: TOP_N if not self.show_all else None]
+        visible = sort_procs(snap.processes, "resident")[: self.top_n if not self.show_all else None]
         if self.group_mode == "none":
-            visible = self._ordered(snap)[: TOP_N if not self.show_all else None]
+            visible = self._ordered(snap)[: self.top_n if not self.show_all else None]
         self.collector.resolve_runtimes(visible + sort_procs(snap.processes, "resident"), time_budget=0.3)
         self.collector.refresh_pss(visible, time_budget=0.2)
         self.call_from_thread(self.apply, snap)
@@ -373,17 +479,25 @@ class MemTaskManApp(App):
         lines: list[Text] = []
         status = Text()
         status.append("memtaskman", style="bold")
-        mode = {"none": "per process", "app": "grouped by app", "cgroup": "grouped by cgroup"}[self.group_mode]
+        mode = {"none": "tree" if self.tree_mode else "per process", "app": "grouped by app",
+                "cgroup": "grouped by cgroup"}[self.group_mode]
         status.append(f"  sort:{self.sort_key}  {mode}"
-                      f"  {'all' if self.show_all else f'top {TOP_N}'}  {len(snap.processes)} processes", style="dim")
+                      f"  {'all' if self.show_all else f'top {self.top_n}'}  {len(snap.processes)} processes", style="dim")
         sm0 = snap.system
         if sm0 and sm0.pressure_some is not None:
             full = sm0.pressure_full or 0.0
             style = "bold red" if full >= 5 else "yellow" if sm0.pressure_some >= 5 else "dim"
             status.append(f"  pressure some {sm0.pressure_some:.1f}% full {full:.1f}%", style=style)
+        if sm0 and sm0.oom_kills_new:
+            status.append(f"  {sm0.oom_kills_new} OOM kill(s) since start", style="bold red")
+        if sm0 and sm0.low_memory:
+            status.append("  LOW MEMORY", style="bold red")
+        if sm0 and sm0.commit_used and sm0.commit_limit and sm0.commit_used >= 0.9 * sm0.commit_limit:
+            status.append(f"  commit {100 * sm0.commit_used / sm0.commit_limit:.0f}% of limit", style="bold red")
         if sm0 and sm0.pressure_level:
             style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
             status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
+        status.append(f"  {'GiB' if units() == 'binary' else 'GB'}", style="dim")
         if self.filter_text:
             status.append(f'  filter "{self.filter_text}"', style="bold cyan")
         if self.paused:
@@ -463,6 +577,39 @@ class MemTaskManApp(App):
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
         extra = []
+        if sm.slab_top:
+            extra.append(Text("Kernel slab caches", style="bold dim"))
+            for r in sm.slab_top[:6]:
+                extra.append(Text(f"  {r['cache'][:22]:<22} {fmt_bytes(r['bytes']):>8}", style="dim"))
+        sh = sm.shared or {}
+        if sh.get("tmpfs") or sh.get("sysv") or sh.get("files"):
+            extra.append(Text("RAM held outside processes", style="bold dim"))
+            for mnt in sh.get("tmpfs", [])[:4]:
+                extra.append(Text(f"  tmpfs {mnt['mount'][:20]:<20} {fmt_bytes(mnt['used']):>8}", style="dim"))
+            if sh.get("sysv"):
+                rss = sum(s["rss"] for s in sh["sysv"])
+                extra.append(Text(f"  SysV shm  {len(sh['sysv'])} segment(s), {fmt_bytes(rss)} resident", style="dim"))
+            names = {p.pid: p.name for p in self.snapshot.processes} if self.snapshot else {}
+            for f in sh.get("files", [])[:4]:
+                who = ", ".join(sorted({names.get(h, str(h)) for h in f["holders"]}))[:30]
+                size = fmt_bytes(f["size"]) if f["size"] is not None else "?"
+                extra.append(Text(f"  {f['path'][:26]:<26} {size:>7}  {who}", style="dim"))
+        if sm.pool_tags:
+            extra.append(Text("Kernel pool by tag (nonpaged / paged, growth per min)", style="bold dim"))
+            for r in sm.pool_tags[:6] + [r for r in sm.pool_tags[6:] if (r["growth_ps"] or 0) > 16 * 1024]:
+                g = r["growth_ps"]
+                line = Text(f"  {r['tag']:<6}", style="cyan")
+                line.append(f"{fmt_bytes(r['nonpaged']):>8} {fmt_bytes(r['paged']):>8}")
+                if g is not None and abs(g) >= 1024:
+                    line.append(f"  {'+' if g > 0 else '-'}{fmt_bytes(abs(g) * 60)}/min",
+                                style="bold red" if g > 64 * 1024 else "yellow" if g > 0 else "green")
+                extra.append(line)
+        for pf in sm.pagefiles or []:
+            line = Text(f"Pagefile {pf['path']}", style="dim")
+            line.append(f"  {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, peak {fmt_bytes(pf['peak'])}")
+            extra.append(line)
+        if sm.pagefiles == []:
+            extra.append(Text("No pagefile: commit limit = RAM", style="yellow"))
         if why:
             extra.append(Text("Unavailable", style="bold dim"))
             for label, reason in why:
@@ -478,7 +625,13 @@ class MemTaskManApp(App):
             procs = snap.processes
         if self.filter_text:
             procs = [p for p in procs if matches(p, self.filter_text)]
-        return sort_procs(procs, self.sort_key)
+        if self.tree_mode and self.group_mode == "none":
+            rows = ptree.flatten(procs, lambda ps: sort_procs(ps, self.sort_key, self.sort_invert),
+                                 collapsed=self.tree_collapsed, expanded=self.tree_expanded)
+            self.tree_rows = {self._row_key(r.proc): r for r in rows}
+            return [r.proc for r in rows]
+        self.tree_rows = {}
+        return sort_procs(procs, self.sort_key, self.sort_invert)
 
     def _row_key(self, p: ProcessMem) -> str:
         if self.group_mode == "cgroup":
@@ -489,7 +642,7 @@ class MemTaskManApp(App):
         t = self.query_one("#procs", DataTable)
         procs = self._ordered(self.snapshot)
         if not self.show_all:
-            procs = procs[:TOP_N]
+            procs = procs[: self.top_n]
         if self.selected and not any(self._row_key(p) == self.selected for p in procs):
             # Keep the selected process visible even when it drops out of the top N.
             sel = next((p for p in self._ordered(self.snapshot) if self._row_key(p) == self.selected), None)
@@ -521,6 +674,12 @@ class MemTaskManApp(App):
             name = Text(p.name)
             if p.leak:
                 name = Text("▲ ", style="bold red").append(p.name, style="red")
+            tr = self.tree_rows.get(k)
+            if tr is not None:
+                marker = ("▸ " if tr.collapsed else "▾ ") if tr.children else "  "
+                name = Text(tr.prefix, style="dim").append(marker, style="cyan").append_text(name)
+                if tr.collapsed:
+                    name.append(f" +{tr.descendants}", style="dim")
             cells = [
                 Text(f"×{p.count}" if self.grouped else str(p.pid), justify="right"),
                 name,
@@ -571,7 +730,7 @@ class MemTaskManApp(App):
         else:
             target = p
         self.last_inspect = time.monotonic()
-        self.inspect_worker(target, p.count)
+        self.inspect_worker(target, 1 if self.tree_mode else p.count)
 
     @ui_callback
     def show_cgroup(self, row: ProcessMem) -> None:
@@ -718,11 +877,80 @@ class MemTaskManApp(App):
             self.render_table()
 
     def action_sort(self) -> None:
-        self.sort_key = self.sort_keys[(self.sort_keys.index(self.sort_key) + 1) % len(self.sort_keys)]
+        i = self.sort_keys.index(self.sort_key) if self.sort_key in self.sort_keys else -1
+        self.sort_key, self.sort_invert = self.sort_keys[(i + 1) % len(self.sort_keys)], False
         self.notify(f"sort: {self.sort_key}", timeout=1.5)
+        self._update_header_arrows()
+        self._refresh_now()
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "kill" and self.read_only:
+            return False  # hidden from the footer and inert
+        return True
+
+    def _selected_process(self) -> ProcessMem | None:
+        """The real process under the cursor (not a tree subtree total or a group)."""
+        row = self.rows.get(self.selected) if self.selected else None
+        if row is None or self.snapshot is None or self.group_mode != "none":
+            return row
+        return next((q for q in self.snapshot.processes if q.key == row.key), row)
+
+    def action_kill(self) -> None:
+        p = self._selected_process()
+        if p is None:
+            self.notify("select a process first", severity="warning")
+            return
+        why = killer.refuse_reason(p)
+        if why:
+            self.notify(f"won't end it: {why}", severity="warning", timeout=4)
+            return
+        force = time.monotonic() - self.polite_sent.get(p.key, -1e9) < 120
+
+        def done(confirmed: bool | None) -> None:
+            if confirmed:
+                self.kill_worker(p, force)
+
+        self.push_screen(KillScreen(p, force), done)
+
+    @work(thread=True, group="kill")
+    def kill_worker(self, p: ProcessMem, force: bool) -> None:
+        sent, msg = killer.end_process(p, force=force)
+        if not force and not sent and "polite" in msg:
+            self.polite_sent[p.key] = time.monotonic()  # next k forces
+        self.call_from_thread(self.notify, msg, severity="information" if sent else "warning", timeout=4)
+        if sent and not force:
+            self.polite_sent[p.key] = time.monotonic()
+            time.sleep(3)
+            if isinstance(killer.verify(p), killer.psutil.Process):
+                self.call_from_thread(self.notify, f"{p.name} is still running; press k again to force it",
+                                      severity="warning", timeout=6)
+
+    def action_tree(self) -> None:
+        self.tree_mode = not self.tree_mode
+        if self.tree_mode and self.group_mode != "none":
+            self.group_mode = "none"
+            self._setup_columns()
+        self.notify("tree view: Enter collapses / expands" if self.tree_mode else "flat view", timeout=1.5)
+        self._refresh_now()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a tree row collapses or expands it."""
+        key = event.row_key.value if event.row_key else None
+        tr = self.tree_rows.get(key) if key else None
+        if not self.tree_mode or tr is None or not tr.children:
+            return
+        pk = tr.proc.key
+        if tr.collapsed:
+            self.tree_collapsed.discard(pk)
+            self.tree_expanded.add(pk)
+        else:
+            self.tree_expanded.discard(pk)
+            self.tree_collapsed.add(pk)
         self._refresh_now()
 
     def action_group(self) -> None:
+        if self.tree_mode:
+            self.tree_mode = False
         modes = list(GROUP_MODES)
         if self.snapshot is not None and self.snapshot.cgroups is None and "cgroup" in modes:
             modes.remove("cgroup")
@@ -749,6 +977,15 @@ class MemTaskManApp(App):
     def action_pause(self) -> None:
         self.paused = not self.paused
         self._refresh_now()
+
+    def action_units(self) -> None:
+        set_units("decimal" if units() == "binary" else "binary")
+        self.notify(units_legend(), timeout=2)
+        self.render_charts()
+        self.render_system()
+        self._refresh_now()
+        if self.inspection:
+            self.show_inspection(self.inspection)
 
     def action_filter(self) -> None:
         inp = self.query_one("#filter", Input)

@@ -25,6 +25,20 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(fmt_bytes(-2 * G), "-2.00G")
         self.assertEqual(fmt_bytes(G, long=True), "1.00GiB")
 
+    def test_decimal_units(self):
+        from memtaskman.fmt import set_units, units_legend
+
+        try:
+            set_units("decimal")
+            self.assertEqual(fmt_bytes(1_500_000_000), "1.50G")
+            self.assertEqual(fmt_bytes(G, long=True), "1.07GB")
+            self.assertIn("GB", units_legend())
+        finally:
+            set_units("binary")
+        self.assertEqual(fmt_bytes(1_500_000_000), "1.40G")
+        with self.assertRaises(ValueError):
+            set_units("metric")
+
     def test_rates(self):
         self.assertEqual(fmt_rate(None), "-")
         self.assertEqual(fmt_rate(10), "0")
@@ -66,6 +80,10 @@ class AggregationTests(unittest.TestCase):
         self.assertEqual([p.pid for p in sort_procs(procs, "resident")], [2, 1, 3])
         self.assertEqual([p.pid for p in sort_procs(procs, "private")], [2, 1, 3])
         self.assertEqual([p.name for p in sort_procs(procs, "name")], ["a", "b", "c"])
+        self.assertEqual([p.pid for p in sort_procs(procs, "resident", invert=True)], [3, 1, 2])
+        self.assertEqual([p.name for p in sort_procs(procs, "name", invert=True)], ["c", "b", "a"])
+        procs[0].runtime, procs[1].runtime = "Java", ".NET"
+        self.assertEqual([p.runtime for p in sort_procs(procs, "runtime")], [".NET", "Java", None])  # unknown last
 
 
 class FilterTests(unittest.TestCase):

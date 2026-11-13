@@ -77,8 +77,18 @@ home directories are shown as `~`.
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
   counted once), with anon / file / shmem / kernel breakdown, `memory.max` limits, OOM kills and
   per-cgroup memory pressure in the inspector.
+- **Linux extras**: OOM kills since boot (status line flags new ones) and, in the inspector, each
+  process's OOM score and its place in the OOM killer's queue; zram and zswap under Compressed;
+  KSM savings and hugepage reservations; the largest kernel slab caches (root only); and RAM no
+  process owns: tmpfs mounts, SysV shared memory, and `/dev/shm` / memfd files with the
+  processes holding them.
 - **Memory pressure** (Linux PSI): the percentage of time tasks stalled waiting for memory,
   shown in the status line and as a chart. It's a better out-of-memory signal than "% used".
+- **Kernel pool by tag** (Windows, like `poolmon`): the largest paged / nonpaged pool tags and how
+  fast each grows, plus any small tag growing fast. A steadily growing nonpaged tag is how a
+  driver leak looks. Works without admin. Map tags to drivers with Microsoft's `pooltag.txt`.
+- **Pagefiles and low memory** (Windows): size, use and peak per pagefile; the status line flags
+  Windows' own low-memory signal and commit charge above 90% of the limit.
 - **Standby by priority** (Windows): the standby cache split into reserve, normal and core,
   in the order Windows reuses them.
 - **Inspector** for the selected process, built from a page-level walk of its address space:
@@ -117,6 +127,13 @@ uv tool install memtaskman    # or: pipx install memtaskman
 mtm                           # or: memtaskman
 ```
 
+**Scoop** (Windows):
+
+```powershell
+scoop bucket add memtaskman https://github.com/Yogpod/memtaskman
+scoop install memtaskman
+```
+
 **Portable, no Python needed:** download the zip (Windows x64 / ARM64) or tar.gz (Linux x64 /
 ARM64, glibc 2.35+) from the [latest release](https://github.com/Yogpod/memtaskman/releases/latest),
 extract it, and run `mtm` inside. Keep the `_internal` folder next to it. Each archive has a
@@ -131,6 +148,29 @@ uv run mtm                # or: uv tool install .
 The layout adapts to the terminal: below 150 columns the system panel and inspector move under
 the table, less important columns are dropped as space runs out, and charts are hidden below 36
 rows. It's usable down to 80×24; the full view wants about 190 columns.
+
+### Configuration
+
+Defaults can live in a TOML file; command-line flags always win.
+
+| OS | Location |
+|---|---|
+| Windows | `%APPDATA%\memtaskman\config.toml` |
+| Linux | `~/.config/memtaskman/config.toml` (or `$XDG_CONFIG_HOME`) |
+| macOS | `~/Library/Application Support/memtaskman/config.toml` |
+
+```toml
+sort = "growth"      # resident | pss | uss | private | growth | faults | name | pid
+group = "none"       # none | app | cgroup
+tree = true
+top = 40
+units = "decimal"    # binary (GiB) | decimal (GB)
+interval = 2.0
+```
+
+`mtm --print-config` prints every setting with its effective value and whether it came from a
+flag, the file or the default, as TOML you can paste into the file. `MEMTASKMAN_CONFIG` points
+to a different file. Unknown keys and bad values are reported and ignored, never fatal.
 
 ### Permissions
 
@@ -149,8 +189,11 @@ table, but some of their values show `-`, and the inspector explains why. For th
 | Key        | Action                                   |
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
+| `k`        | end the selected process: type its name to confirm; polite first, `k` again to force (disabled by `--read-only`) |
+| `t`        | process tree (Enter collapses / expands; collapsed rows show subtree totals) |
+| `u`        | binary (GiB) / decimal (GB) units |
 | `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
-| `s`        | cycle sort: resident, PSS (Linux), private, growth, faults, name, pid |
+| `s`        | cycle sort (or click any column header; click again to reverse) |
 | `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
 | `a`        | top 50 / all processes                   |
 | `c`        | cycle charts (all, or one metric)        |
@@ -167,6 +210,10 @@ mtm -i 2                    sample every 2 seconds
 mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
+mtm --sort growth --tree     initial sort / view (also --group app|cgroup, --slim)
+mtm --print-config          effective settings (config file + flags) as TOML
+mtm --read-only             disable ending processes (also read_only = true in the config)
+mtm --units decimal         1G = 1 GB (10⁹ bytes) instead of 1 GiB; JSON always stays in bytes
 mtm --once --filter brave   only processes matching a name, runtime or PID (also --json, record)
 mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
 mtm inspect PID [--json]    address-space breakdown of one process
@@ -228,6 +275,9 @@ Caveats:
 
 - memtaskman reads memory **metadata** (sizes, page states, mapped file names), never the
   contents of another process's memory. Model files are read up to their GGUF header only.
+- Read-only except for one deliberate action: `k` ends a process, only after you type its name,
+  never for critical system processes, and only if the PID still belongs to the same process.
+  `--read-only` removes it.
 - No telemetry. The only network request is an optional `GET /api/ps` to an Ollama server on
   localhost, made only while you inspect an Ollama process.
 - `--json`, `record` and `inspect` output contain process names, command lines, file paths

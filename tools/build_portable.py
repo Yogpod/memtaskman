@@ -80,6 +80,8 @@ def smoke(app_dir: Path) -> None:
         print(r.stdout.strip()[-600:])
         if r.returncode != 0:
             raise SystemExit(f"portable smoke test failed: {args}\n{r.stderr}")
+        if args == ["--version"] and r.stdout.strip() != f"memtaskman {version()}":
+            raise SystemExit(f"bundle reports {r.stdout.strip()!r}, expected memtaskman {version()}")
 
 
 def package(app_dir: Path) -> Path:

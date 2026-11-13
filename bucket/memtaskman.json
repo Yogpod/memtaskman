@@ -1,0 +1,44 @@
+{
+    "version": "0.2.0",
+    "description": "An htop for what's inside your RAM, not just how full it is.",
+    "homepage": "https://github.com/Yogpod/memtaskman",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/Yogpod/memtaskman/releases/download/v0.2.0/memtaskman-0.2.0-windows-x64.zip",
+            "hash": "5b0719fd2572c77a00c1624038eaa81cb0b13585b40938c0c30b1a4e40d6e742",
+            "extract_dir": "memtaskman-0.2.0-windows-x64"
+        },
+        "arm64": {
+            "url": "https://github.com/Yogpod/memtaskman/releases/download/v0.2.0/memtaskman-0.2.0-windows-arm64.zip",
+            "hash": "aeb72394175b073559826d2e116de49e138a66eba10030bef90dcceeac71e254",
+            "extract_dir": "memtaskman-0.2.0-windows-arm64"
+        }
+    },
+    "bin": [
+        "mtm.exe",
+        [
+            "mtm.exe",
+            "memtaskman"
+        ]
+    ],
+    "checkver": "github",
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/Yogpod/memtaskman/releases/download/v$version/memtaskman-$version-windows-x64.zip",
+                "extract_dir": "memtaskman-$version-windows-x64",
+                "hash": {
+                    "url": "$url.sha256"
+                }
+            },
+            "arm64": {
+                "url": "https://github.com/Yogpod/memtaskman/releases/download/v$version/memtaskman-$version-windows-arm64.zip",
+                "extract_dir": "memtaskman-$version-windows-arm64",
+                "hash": {
+                    "url": "$url.sha256"
+                }
+            }
+        }
+    }
+}

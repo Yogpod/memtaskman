@@ -49,6 +49,8 @@ def cmd_main(args) -> int:
     if args.once or args.json:
         from memtaskman import report
 
+        args.top = args.top or 25  # the config file's 'top' is for the TUI
+
         c, snap = _snapshot(args)
         c.close()
         if args.filter:
@@ -63,7 +65,7 @@ def cmd_main(args) -> int:
     from memtaskman.app import MemTaskManApp
 
     MemTaskManApp(interval=args.interval, system=not args.no_system, wsl_guest=not args.no_host,
-                  privacy=args.privacy).run()
+                  privacy=args.privacy, settings=getattr(args, "settings", None)).run()
     return 0
 
 
@@ -191,13 +193,24 @@ def parse_duration(text: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="memtaskman", description="An htop for what's inside your RAM, not just how full it is.")
     p.add_argument("--version", action="version", version=f"memtaskman {__version__}")
-    p.add_argument("-i", "--interval", type=float, default=1.0, help="sample interval in seconds (default 1)")
+    p.add_argument("-i", "--interval", type=float, default=None, help="sample interval in seconds (default 1)")
     p.add_argument("--once", action="store_true", help="print one text report and exit")
     p.add_argument("--json", action="store_true", help="print one JSON snapshot and exit")
-    p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
+    p.add_argument("--top", type=int, default=None,
+                   help="rows: in the TUI (default 50) or in --once/--json output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--sort", choices=["resident", "pss", "uss", "private", "growth", "faults", "name", "pid"],
+                   help="initial sort column")
+    p.add_argument("--group", choices=["none", "app", "cgroup"], help="initial grouping")
+    p.add_argument("--tree", action="store_true", help="start in the process tree view")
+    p.add_argument("--slim", action="store_true", help="start in slim mode")
+    p.add_argument("--read-only", action="store_true", help="disable ending processes (the k key)")
+    p.add_argument("--print-config", action="store_true",
+                   help="show the effective settings (config file + flags) as TOML and exit")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--units", choices=["binary", "decimal"], default=None,
+                   help="binary: 1G = 1 GiB (default, like OS counters); decimal: 1G = 1 GB (like Explorer)")
     p.add_argument("--filter", metavar="TEXT", help="only processes whose name, runtime or PID matches TEXT")
     p.add_argument("--privacy", action="store_true",
                    help="hide command lines and home-directory paths (for screenshots and screen sharing)")
@@ -242,8 +255,48 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def apply_config(args) -> tuple[dict, dict, list[str]]:
+    """Merge the config file under the command-line flags; flags win."""
+    from memtaskman import config
+
+    file_settings, warnings = config.load()
+    cli = {
+        "interval": args.interval,
+        "units": args.units,
+        "sort": getattr(args, "sort", None),
+        "group": getattr(args, "group", None),
+        "tree": True if getattr(args, "tree", False) else None,
+        "slim": True if getattr(args, "slim", False) else None,
+        "all": True if args.all else None,
+        "top": args.top,
+        "privacy": True if args.privacy else None,
+        "system": False if args.no_system else None,
+        "wsl_guest": False if args.no_host else None,
+        "read_only": True if getattr(args, "read_only", False) else None,
+    }
+    eff, src = config.resolve(cli, file_settings)
+    return eff, src, warnings
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if getattr(args, "func", None):
+    from memtaskman import config
+    from memtaskman.fmt import set_units
+
+    if getattr(args, "func", None):  # subcommands: only units come from the config file
+        file_settings, _warnings = config.load()
+        set_units(getattr(args, "units", None) or file_settings.get("units", "binary"))
         return args.func(args)
+    eff, src, warnings = apply_config(args)
+    for w in warnings:
+        print(f"memtaskman: config: {w}", file=sys.stderr)
+    if args.print_config:
+        print(config.render(eff, src, config.config_path()))
+        return 0
+    set_units(eff["units"])
+    args.interval = eff["interval"]
+    args.no_system = not eff["system"]
+    args.no_host = not eff["wsl_guest"]
+    args.privacy = eff["privacy"]
+    args.settings = eff
     return cmd_main(args)
