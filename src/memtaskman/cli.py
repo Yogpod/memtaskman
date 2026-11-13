@@ -36,7 +36,8 @@ def cmd_main(args) -> int:
         return 0
     from memtaskman.app import MemTaskManApp
 
-    MemTaskManApp(interval=args.interval, system=not args.no_system, wsl_guest=not args.no_host).run()
+    MemTaskManApp(interval=args.interval, system=not args.no_system, wsl_guest=not args.no_host,
+                  privacy=args.privacy).run()
     return 0
 
 
@@ -152,6 +153,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=25, help="processes in --once/--json/record output (default 25)")
     p.add_argument("--all", action="store_true", help="include every process in --once/--json/record output")
     p.add_argument("--no-system", action="store_true", help="skip system-wide counters")
+    p.add_argument("--privacy", action="store_true",
+                   help="hide command lines and home-directory paths (for screenshots and screen sharing)")
     p.add_argument("--no-host", action="store_true",
                    help="Windows: don't read the WSL2 guest's memory when inspecting vmmemWSL")
     sub = p.add_subparsers(dest="cmd")

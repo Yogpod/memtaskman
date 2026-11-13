@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 _UNITS = ["B", "K", "M", "G", "T", "P"]
 
 
@@ -56,6 +58,20 @@ def pct(part: float | None, whole: float | None) -> float | None:
     if part is None or not whole:
         return None
     return 100.0 * part / whole
+
+
+_HOME_PATTERNS = [
+    (re.compile(r"(?i)\b[a-z]:\\users\\[^\\/\s]+"), "~"),
+    (re.compile(r"(?i)\b[a-z]:/users/[^\\/\s]+"), "~"),
+    (re.compile(r"/(?:home|Users)/[^/\s]+"), "~"),
+]
+
+
+def redact(text: str) -> str:
+    """Replace user home directories (which contain the username) with ~."""
+    for pat, repl in _HOME_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
 
 
 def parse_size(text: str) -> int | None:

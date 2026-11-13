@@ -3,7 +3,7 @@ import unittest
 from memtaskman.app import ram_segments, stacked_bar
 from memtaskman.collector import Collector, group_by_app, sort_procs
 from memtaskman.diff import diff_snapshots
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, parse_size
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, parse_size, redact
 from memtaskman.model import ProcessMem, Snapshot, SystemMemory
 from memtaskman.report import render_text
 
@@ -33,6 +33,13 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(fmt_count_rate(0.3), "0")
         self.assertEqual(fmt_count_rate(1500), "1.5k")
         self.assertEqual(fmt_count_rate(25000), "25k")
+
+    def test_redact_home_paths(self):
+        self.assertEqual(redact(r"C:\Users\alice\AppData\x.dll"), r"~\AppData\x.dll")
+        self.assertEqual(redact("c:/users/bob/x"), "~/x")
+        self.assertEqual(redact("/home/carol/.cache/model.gguf"), "~/.cache/model.gguf")
+        self.assertEqual(redact("/Users/dave/Library/x"), "~/Library/x")
+        self.assertEqual(redact(r"C:\Windows\System32\ntdll.dll"), r"C:\Windows\System32\ntdll.dll")
 
     def test_parse_size(self):
         self.assertEqual(parse_size("4g"), 4 * G)

@@ -19,7 +19,7 @@ from textual.widgets import DataTable, Footer, Sparkline, Static
 from memtaskman.collector import LINUX, WINDOWS, Collector, group_by_app, sort_procs, unique_column
 
 UNIQUE = unique_column()
-from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct
+from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
 from memtaskman.model import DERIVED, HINT, IDENTIFIED, MEASURED, Inspection, ProcessMem, Snapshot, SystemMemory
 
 HISTORY = 120
@@ -162,8 +162,10 @@ class MemTaskManApp(App):
         Binding("question_mark", "help", "Help", key_display="?"),
     ]
 
-    def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True):
+    def __init__(self, interval: float = 1.0, system: bool = True, wsl_guest: bool = True,
+                 privacy: bool = False):
         super().__init__()
+        self.privacy = privacy  # hide command lines and home-directory paths (screenshots, demos)
         self.interval = max(0.25, interval)
         self.collector = Collector(system=system, wsl_guest=wsl_guest)
         self.history: dict[str, deque[float]] = {k: deque(maxlen=HISTORY) for k, _, _ in CHARTS}
@@ -578,7 +580,7 @@ class MemTaskManApp(App):
             ft.add_column(justify="right")
             ft.add_column(no_wrap=True, overflow="ellipsis")
             for f in ins.top_files:
-                pp = PureWindowsPath(f.path)
+                pp = PureWindowsPath(redact(f.path) if self.privacy else f.path)
                 label = Text(pp.name)
                 parent = str(pp.parent)
                 label.append("  " + (parent if len(parent) <= 30 else "…" + parent[-29:]), style="dim")
@@ -587,11 +589,12 @@ class MemTaskManApp(App):
         if ins.evidence:
             parts.append(Text("\nEvidence", style="bold"))
             for level, text in ins.evidence:
+                text = redact(text) if self.privacy else text
                 line = Text()
                 line.append(f"{level:<11}", style=LEVEL_STYLE.get(level, ""))
                 line.append(text)
                 parts.append(line)
-        if ins.cmdline:
+        if ins.cmdline and not self.privacy:
             parts.append(Text("\n" + " ".join(ins.cmdline)[:300], style="dim"))
         parts.append(Text(f"\ninspected in {ins.elapsed * 1000:.0f} ms, refreshes every {INSPECT_EVERY:.0f}s", style="dim"))
         self.query_one("#inspect-body", Static).update(Group(*parts))
