@@ -127,6 +127,13 @@ uv tool install memtaskman    # or: pipx install memtaskman
 mtm                           # or: memtaskman
 ```
 
+**Scoop** (Windows):
+
+```powershell
+scoop bucket add memtaskman https://github.com/Yogpod/memtaskman
+scoop install memtaskman
+```
+
 **Portable, no Python needed:** download the zip (Windows x64 / ARM64) or tar.gz (Linux x64 /
 ARM64, glibc 2.35+) from the [latest release](https://github.com/Yogpod/memtaskman/releases/latest),
 extract it, and run `mtm` inside. Keep the `_internal` folder next to it. Each archive has a
