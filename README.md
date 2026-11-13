@@ -149,6 +149,7 @@ table, but some of their values show `-`, and the inspector explains why. For th
 | Key        | Action                                   |
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
+| `t`        | process tree (Enter collapses / expands; collapsed rows show subtree totals) |
 | `u`        | binary (GiB) / decimal (GB) units |
 | `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
 | `s`        | cycle sort (or click any column header; click again to reverse) |

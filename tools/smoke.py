@@ -119,6 +119,20 @@ async def tui_checks() -> None:
         await pilot.pause(0.3)
         check(app.sort_invert, "second header click reverses")
         app.sort_key, app.sort_invert = "resident", False
+        await pilot.press("t")
+        await pilot.pause(1.0)
+        tree_ok = bool(app.tree_rows) and any(r.depth > 0 for r in app.tree_rows.values())
+        check(tree_ok, f"tree view: {len(app.tree_rows)} rows with nesting")
+        parent = next((k for k, r in app.tree_rows.items() if r.children), None)
+        if parent:
+            was = app.tree_rows[parent].collapsed
+            table = app.query_one("#procs")
+            table.move_cursor(row=list(app.rows).index(parent))
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+            check(parent in app.tree_rows and app.tree_rows[parent].collapsed != was, "Enter toggles a tree node")
+        await pilot.press("t")
+        await pilot.pause(0.5)
         target = app.snapshot.processes[0].name[:4]
         await pilot.press("slash", *list(target.lower()))
         await pilot.pause(0.5)

@@ -31,6 +31,7 @@ from memtaskman.collector import (
 )
 
 UNIQUE = unique_column()
+from memtaskman import tree as ptree
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact, set_units, units, units_legend
 from memtaskman.model import (
     DERIVED,
@@ -133,7 +134,10 @@ HELP = f"""\
 [b]Units[/b] sizes use binary units by default (1G = 1 GiB = 1024³ bytes), like the OS counters.
   u switches to decimal (1G = 1 GB = 10⁹ bytes), as used by Explorer and disk vendors.
 
-[b]Keys[/b]  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Tree[/b] (t) parents with their children. Enter collapses / expands a node; a collapsed node shows
+  its subtree's totals (+N = hidden descendants). Nodes with many children start collapsed.
+
+[b]Keys[/b]  t tree  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -238,6 +242,7 @@ class MemTaskManApp(App):
         Binding("p", "pause", "Pause"),
         Binding("slash", "filter", "Filter", key_display="/"),
         Binding("u", "units", "Units", show=False),
+        Binding("t", "tree", "Tree"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
@@ -252,6 +257,10 @@ class MemTaskManApp(App):
         self.sort_keys = ["resident"] + ([UNIQUE[1]] if UNIQUE else []) + ["private", "growth", "faults", "name", "pid"]
         self.sort_key = "resident"
         self.sort_invert = False  # second click on the same header reverses the order
+        self.tree_mode = False
+        self.tree_collapsed: set = set()  # explicit user choices, by process key
+        self.tree_expanded: set = set()
+        self.tree_rows: dict[str, ptree.TreeRow] = {}
         self.col_labels: dict[str, str] = {}
         self.show_all = False
         self.group_mode = "none"  # none | app | cgroup (Linux)
@@ -417,7 +426,8 @@ class MemTaskManApp(App):
         lines: list[Text] = []
         status = Text()
         status.append("memtaskman", style="bold")
-        mode = {"none": "per process", "app": "grouped by app", "cgroup": "grouped by cgroup"}[self.group_mode]
+        mode = {"none": "tree" if self.tree_mode else "per process", "app": "grouped by app",
+                "cgroup": "grouped by cgroup"}[self.group_mode]
         status.append(f"  sort:{self.sort_key}  {mode}"
                       f"  {'all' if self.show_all else f'top {TOP_N}'}  {len(snap.processes)} processes", style="dim")
         sm0 = snap.system
@@ -523,6 +533,12 @@ class MemTaskManApp(App):
             procs = snap.processes
         if self.filter_text:
             procs = [p for p in procs if matches(p, self.filter_text)]
+        if self.tree_mode and self.group_mode == "none":
+            rows = ptree.flatten(procs, lambda ps: sort_procs(ps, self.sort_key, self.sort_invert),
+                                 collapsed=self.tree_collapsed, expanded=self.tree_expanded)
+            self.tree_rows = {self._row_key(r.proc): r for r in rows}
+            return [r.proc for r in rows]
+        self.tree_rows = {}
         return sort_procs(procs, self.sort_key, self.sort_invert)
 
     def _row_key(self, p: ProcessMem) -> str:
@@ -566,6 +582,12 @@ class MemTaskManApp(App):
             name = Text(p.name)
             if p.leak:
                 name = Text("▲ ", style="bold red").append(p.name, style="red")
+            tr = self.tree_rows.get(k)
+            if tr is not None:
+                marker = ("▸ " if tr.collapsed else "▾ ") if tr.children else "  "
+                name = Text(tr.prefix, style="dim").append(marker, style="cyan").append_text(name)
+                if tr.collapsed:
+                    name.append(f" +{tr.descendants}", style="dim")
             cells = [
                 Text(f"×{p.count}" if self.grouped else str(p.pid), justify="right"),
                 name,
@@ -616,7 +638,7 @@ class MemTaskManApp(App):
         else:
             target = p
         self.last_inspect = time.monotonic()
-        self.inspect_worker(target, p.count)
+        self.inspect_worker(target, 1 if self.tree_mode else p.count)
 
     @ui_callback
     def show_cgroup(self, row: ProcessMem) -> None:
@@ -769,7 +791,32 @@ class MemTaskManApp(App):
         self._update_header_arrows()
         self._refresh_now()
 
+    def action_tree(self) -> None:
+        self.tree_mode = not self.tree_mode
+        if self.tree_mode and self.group_mode != "none":
+            self.group_mode = "none"
+            self._setup_columns()
+        self.notify("tree view: Enter collapses / expands" if self.tree_mode else "flat view", timeout=1.5)
+        self._refresh_now()
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a tree row collapses or expands it."""
+        key = event.row_key.value if event.row_key else None
+        tr = self.tree_rows.get(key) if key else None
+        if not self.tree_mode or tr is None or not tr.children:
+            return
+        pk = tr.proc.key
+        if tr.collapsed:
+            self.tree_collapsed.discard(pk)
+            self.tree_expanded.add(pk)
+        else:
+            self.tree_expanded.discard(pk)
+            self.tree_collapsed.add(pk)
+        self._refresh_now()
+
     def action_group(self) -> None:
+        if self.tree_mode:
+            self.tree_mode = False
         modes = list(GROUP_MODES)
         if self.snapshot is not None and self.snapshot.cgroups is None and "cgroup" in modes:
             modes.remove("cgroup")
