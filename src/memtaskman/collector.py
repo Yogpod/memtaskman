@@ -98,6 +98,7 @@ class Collector:
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
         self._cg_tracks: dict[str, _Track] = {}
+        self._pool_hist: deque = deque(maxlen=7)  # (time, {tag: total}) every ~10 s: ~1 minute window
         self._pss_why: dict[tuple[int, float], str] = {}
         self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
         self._leaks: dict[tuple[int, float], leaks.Trend] = {}
@@ -266,6 +267,8 @@ class Collector:
         if sm.page_faults_ps is None:
             why["page_faults_ps"] = WHY_NEEDS_TWO
         if WINDOWS:
+            if sm.pool_tags is None:
+                why["pool_tags"] = "pool tag query refused (some locked-down systems require admin)"
             if self._pdh is None or not self._pdh.counters:
                 why["standby"] = "PDH memory counters unavailable (disabled or corrupted: lodctr /r)"
             if sm.compressed is None:
@@ -326,7 +329,32 @@ class Collector:
             sm.compressed = comp.resident
         sm.pagefiles = native.pagefiles()
         sm.low_memory = native.low_memory()
+        sm.pool_tags = self._pool_tags()
         self._first = False
+
+    def _pool_tags(self, top: int = 20) -> list[dict] | None:
+        tags = native.pool_tags()
+        if tags is None:
+            return None
+        now = time.time()
+        totals = {k: v[0] + v[1] for k, v in tags.items()}
+        if not self._pool_hist or now - self._pool_hist[-1][0] >= 10:
+            self._pool_hist.append((now, totals))
+        t0, old = self._pool_hist[0]
+        dt = now - t0
+        rows = []
+        for k, (np_, pg) in sorted(tags.items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:top]:
+            growth = (totals[k] - old.get(k, 0)) / dt if dt >= 20 else None
+            rows.append({"tag": k, "nonpaged": np_, "paged": pg, "growth_ps": growth})
+        # Fast growers outside the top list are what leak hunts look for: include them too.
+        if dt >= 20:
+            names = {r["tag"] for r in rows}
+            growers = sorted(((k, (totals[k] - old.get(k, 0)) / dt) for k in totals if k not in names),
+                             key=lambda kv: -kv[1])[:5]
+            for k, g in growers:
+                if g > 16 * 1024:  # > 16 KiB/s sustained over a minute
+                    rows.append({"tag": k, "nonpaged": tags[k][0], "paged": tags[k][1], "growth_ps": g})
+        return rows
 
     def _system_macos(self, sm: SystemMemory, now: float) -> None:
         sm.source = "host_statistics64 + sysctl"

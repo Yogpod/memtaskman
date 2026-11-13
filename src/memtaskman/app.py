@@ -575,6 +575,16 @@ class MemTaskManApp(App):
             if value is not None:
                 t.add_row(label, fmt_bytes(value), note)
         extra = []
+        if sm.pool_tags:
+            extra.append(Text("Kernel pool by tag (nonpaged / paged, growth per min)", style="bold dim"))
+            for r in sm.pool_tags[:6] + [r for r in sm.pool_tags[6:] if (r["growth_ps"] or 0) > 16 * 1024]:
+                g = r["growth_ps"]
+                line = Text(f"  {r['tag']:<6}", style="cyan")
+                line.append(f"{fmt_bytes(r['nonpaged']):>8} {fmt_bytes(r['paged']):>8}")
+                if g is not None and abs(g) >= 1024:
+                    line.append(f"  {'+' if g > 0 else '-'}{fmt_bytes(abs(g) * 60)}/min",
+                                style="bold red" if g > 64 * 1024 else "yellow" if g > 0 else "green")
+                extra.append(line)
         for pf in sm.pagefiles or []:
             line = Text(f"Pagefile {pf['path']}", style="dim")
             line.append(f"  {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, peak {fmt_bytes(pf['peak'])}")

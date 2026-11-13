@@ -56,6 +56,7 @@ def collector_checks() -> None:
         check(sm.pagefiles is not None and all(pf["size"] >= pf["used"] for pf in sm.pagefiles),
               f"pagefiles: {[pf['path'] for pf in sm.pagefiles or []]}")
         check(sm.low_memory is not None, f"low-memory notification readable ({sm.low_memory})")
+        check(bool(sm.pool_tags), f"kernel pool tags: {len(sm.pool_tags or [])} rows")
         with_ws = sum(1 for p in snap.processes if p.uss is not None)
         check(me.uss is not None and 0 < me.uss <= me.resident, "own private working set via PDH")
         check(with_ws > len(snap.processes) // 2, f"private working set for {with_ws}/{len(snap.processes)} processes")

@@ -79,6 +79,11 @@ home directories are shown as `~`.
   per-cgroup memory pressure in the inspector.
 - **Memory pressure** (Linux PSI): the percentage of time tasks stalled waiting for memory,
   shown in the status line and as a chart. It's a better out-of-memory signal than "% used".
+- **Kernel pool by tag** (Windows, like `poolmon`): the largest paged / nonpaged pool tags and how
+  fast each grows, plus any small tag growing fast. A steadily growing nonpaged tag is how a
+  driver leak looks. Works without admin. Map tags to drivers with Microsoft's `pooltag.txt`.
+- **Pagefiles and low memory** (Windows): size, use and peak per pagefile; the status line flags
+  Windows' own low-memory signal and commit charge above 90% of the limit.
 - **Standby by priority** (Windows): the standby cache split into reserve, normal and core,
   in the order Windows reuses them.
 - **Inspector** for the selected process, built from a page-level walk of its address space:

@@ -163,6 +163,49 @@ kernel32.QueryMemoryResourceNotification.argtypes = [wt.HANDLE, ctypes.POINTER(w
 _low_memory_handle = None
 
 
+class SYSTEM_POOLTAG(ctypes.Structure):
+    _fields_ = [("Tag", ctypes.c_char * 4), ("PagedAllocs", wt.ULONG), ("PagedFrees", wt.ULONG),
+                ("PagedUsed", ctypes.c_size_t), ("NonPagedAllocs", wt.ULONG), ("NonPagedFrees", wt.ULONG),
+                ("NonPagedUsed", ctypes.c_size_t)]
+
+
+SystemPoolTagInformation = 22
+
+
+def decode_tag(raw: bytes) -> str:
+    """Pool tags are 4 bytes, usually ASCII and space-padded; show anything else as hex."""
+    text = raw.decode("latin-1")
+    return text.rstrip(" \x00") if all(32 <= b < 127 or b == 0 for b in raw) else raw.hex()
+
+
+def pool_tags() -> dict[str, tuple[int, int]] | None:
+    """tag -> (nonpaged bytes, paged bytes) for every kernel pool tag (like poolmon). ~0.2 ms."""
+    size = 256 * 1024
+    for _ in range(5):
+        buf = ctypes.create_string_buffer(size)
+        ret = ctypes.c_ulong(0)
+        status = ntdll.NtQuerySystemInformation(SystemPoolTagInformation, buf, size, ctypes.byref(ret))
+        if status == STATUS_INFO_LENGTH_MISMATCH:
+            size = ret.value + 64 * 1024
+            continue
+        if status != 0:
+            return None
+        break
+    else:
+        return None
+    count = ctypes.c_ulong.from_buffer(buf).value
+    offset = ctypes.sizeof(ctypes.c_size_t)  # Count, padded to pointer alignment
+    if offset + count * ctypes.sizeof(SYSTEM_POOLTAG) > ret.value:
+        return None
+    tags = (SYSTEM_POOLTAG * count).from_buffer(buf, offset)
+    out: dict[str, tuple[int, int]] = {}
+    for t in tags:
+        name = decode_tag(bytes(t.Tag))
+        np_, pg = out.get(name, (0, 0))
+        out[name] = (np_ + t.NonPagedUsed, pg + t.PagedUsed)
+    return out
+
+
 def low_memory() -> bool | None:
     """Windows' own low-physical-memory signal (the one apps use to drop caches)."""
     global _low_memory_handle

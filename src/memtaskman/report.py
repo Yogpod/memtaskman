@@ -35,6 +35,9 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Faults   {fmt_count_rate(sm.page_faults_ps)}/s, hard {fmt_count_rate(sm.hard_faults_ps)}/s")
     for k, v in sm.extra.items():
         lines.append(f"         {k}: {fmt_bytes(v)}")
+    if sm.pool_tags:
+        lines.append("Pool     top tags (nonpaged / paged): " + ", ".join(
+            f"{r['tag']} {fmt_bytes(r['nonpaged'])}/{fmt_bytes(r['paged'])}" for r in sm.pool_tags[:6]))
     for pf in sm.pagefiles or []:
         lines.append(f"Pagefile {pf['path']}: {fmt_bytes(pf['used'])} of {fmt_bytes(pf['size'])} used, "
                      f"peak {fmt_bytes(pf['peak'])}")
