@@ -5,13 +5,16 @@ from __future__ import annotations
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 import psutil
 
+from memtaskman import leaks
 from memtaskman import runtime as rt
 from memtaskman.model import (
     CATEGORY_ORDER,
+    DERIVED,
     HINT,
     Inspection,
     ProcessMem,
@@ -31,6 +34,8 @@ else:  # macOS & others: psutil only
 
 GROWTH_ALPHA = 0.35  # EMA weight for the private-bytes growth rate
 RUNTIME_TTL = 45.0  # seconds before re-checking a process's loaded modules
+LEAK_WINDOW = 600.0  # seconds of private-bytes history kept per process for leak detection
+LEAK_EVERY = 5.0  # re-fit trends at most this often
 PSS_TTL = 2.0  # smaps_rollup makes the kernel walk page tables; refresh visible rows at most this often
 
 
@@ -81,6 +86,9 @@ class Collector:
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
         self._cg_tracks: dict[str, _Track] = {}
+        self._series: dict[tuple[int, float], deque[tuple[float, float]]] = {}
+        self._leaks: dict[tuple[int, float], leaks.Trend] = {}
+        self._leaks_at = 0.0
         self._first = True
         self._lock = threading.RLock()  # sampling and inspection run on different threads
 
@@ -101,6 +109,11 @@ class Collector:
             cached = self._pss.get(p.key)
             if cached:
                 _t, p.pss, p.uss = cached
+        self._update_leaks(now)
+        for p in procs:
+            tr = self._leaks.get(p.key)
+            if tr is not None:
+                p.leak = leaks.describe(tr)
         snap = Snapshot(now, sys.platform, system, procs, private_label())
         if LINUX:
             snap.cgroups = self._cgroup_rows(procs, now)
@@ -151,7 +164,7 @@ class Collector:
         for k in list(self._tracks):
             if k not in seen:
                 del self._tracks[k]
-        for cache in (self._runtimes, self._pss):
+        for cache in (self._runtimes, self._pss, self._series, self._leaks):
             for k in list(cache):
                 if k not in seen:
                     del cache[k]
@@ -159,6 +172,12 @@ class Collector:
 
     def _rates(self, p: ProcessMem, faults: int | None, now: float) -> None:
         basis = p.private if p.private is not None else p.resident
+        ser = self._series.get(p.key)
+        if ser is None:
+            ser = self._series[p.key] = deque()
+        ser.append((now, float(basis)))
+        while ser and now - ser[0][0] > LEAK_WINDOW:
+            ser.popleft()
         prev = self._tracks.get(p.key)
         if prev is None:
             self._tracks[p.key] = _Track(now, basis, faults)
@@ -265,6 +284,19 @@ class Collector:
                 sm.page_faults_ps = (vs["pgfault"] - prev["pgfault"]) / dt
                 sm.hard_faults_ps = (vs.get("pgmajfault", 0) - prev.get("pgmajfault", 0)) / dt
         self._vm_prev = (now, vs)
+
+    def _update_leaks(self, now: float) -> None:
+        if now - self._leaks_at < LEAK_EVERY:
+            return
+        self._leaks_at = now
+        found = {}
+        for key, ser in self._series.items():
+            if len(ser) < leaks.MIN_POINTS or ser[-1][0] - ser[0][0] < leaks.MIN_SPAN_S:
+                continue
+            tr = leaks.fit(list(ser))
+            if tr is not None and tr.is_leak:
+                found[key] = tr
+        self._leaks = found
 
     # ------------------------------------------------------------------ cgroups (Linux)
     def _cgroup_rows(self, procs: list[ProcessMem], now: float) -> list[ProcessMem]:
@@ -397,6 +429,9 @@ class Collector:
             if p.key not in self._runtimes or time.time() - self._runtimes[p.key].checked > RUNTIME_TTL:
                 self._runtimes[p.key] = self._identify(p, time.time())
             info, cmd = self.runtime_of(p.key)
+            tr = self._leaks.get(p.key)
+        if tr is not None:
+            ins.evidence.insert(0, (DERIVED, "possible leak: " + leaks.describe(tr)))
         ins.cmdline = cmd
         if info:
             ins.evidence = [e for e in info.evidence if e[1]] + ins.evidence

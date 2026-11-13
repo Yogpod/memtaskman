@@ -124,6 +124,10 @@ def cli_checks() -> None:
         r = run("record", str(rec), "-i", "0.5", "-n", "2")
         lines = rec.read_text(encoding="utf-8").splitlines() if rec.exists() else []
         check(r.returncode == 0 and len(lines) == 2, "mtm record wrote 2 snapshots")
+        with open(rec, "a", encoding="utf-8") as f:
+            f.write('{"version": 1, "time": 1, "proc')  # simulate an interrupted recording
+        r = run("summary", str(rec))
+        check(r.returncode == 0 and "1 unreadable line" in r.stdout, "mtm summary skips a torn last line")
     r = run("inspect", str(os.getpid()))
     expected = 0 if (WINDOWS or LINUX) else 2
     check(r.returncode == expected, f"mtm inspect <self> exit {r.returncode}")

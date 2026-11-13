@@ -69,6 +69,9 @@ HELP = f"""\
   PrivWS      Windows: private working set, Task Manager's "Memory" column. Pages only this process
               can use; slightly below tools that count shared-but-unshared pages as unique
   Growth      smoothed change of Private per second — a steadily positive value is how leaks look
+  ▲ name      possible leak: private bytes rose in a straight line (R² ≥ 0.85) by ≥ 16 MiB and ≥ 5%
+              over at least 2 minutes of the last 10. GC sawtooth patterns are not flagged.
+              For long runs: mtm record out.jsonl, then mtm summary out.jsonl
   Faults/s    page faults per second (soft + hard)
   Pool/Swap   Windows: kernel pool charged to the process / Linux: swapped-out bytes
 
@@ -404,9 +407,12 @@ class MemTaskManApp(App):
                 if cs.get("oom_kill"):
                     bits.append(f"{cs['oom_kill']} OOM kill(s)")
                 rt = " · ".join(bits) or rt
+            name = Text(p.name)
+            if p.leak:
+                name = Text("▲ ", style="bold red").append(p.name, style="red")
             cells = [
                 Text(f"×{p.count}" if self.grouped else str(p.pid), justify="right"),
-                p.name,
+                name,
                 Text(fmt_bytes(p.resident), justify="right"),
             ]
             if UNIQUE:

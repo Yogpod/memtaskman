@@ -64,6 +64,7 @@ class ProcessMem:
     runtime: str | None = None
     runtime_detail: str | None = None
     count: int = 1  # >1 when this row aggregates several processes (group-by-app view)
+    leak: str | None = None  # description when growth has been steady for minutes (see leaks.py)
     cgroup: str | None = None  # Linux cgroup path (per process) or the group's path (cgroup rows)
     cgroup_stats: dict | None = None  # kernel accounting for cgroup rows (memory.current, stat, limits)
 

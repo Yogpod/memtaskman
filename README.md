@@ -31,6 +31,9 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
   On Linux there is also a **PSS** column (resident memory with shared pages split fairly
   between the processes sharing them, so the column sums to real RAM use), read from
   `smaps_rollup` for the visible rows only. Other users' processes show `-` unless you run as root.
+- **Leak watch**: rows marked **▲** have private bytes that rose in a straight line (least-squares
+  R² ≥ 0.85, at least 16 MiB and 5%) over at least 2 of the last 10 minutes. Garbage-collector
+  sawtooth patterns aren't flagged. For hours-long hunts, `mtm record` then `mtm summary`.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
 - **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
@@ -106,9 +109,14 @@ mtm --once [--top N|--all]  print a text report and exit
 mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
 mtm inspect PID [--json]    address-space breakdown of one process
-mtm record out.jsonl [-i 5] [-n COUNT] [--all]   append snapshots (JSON Lines)
+mtm record out.jsonl [-i 5] [-n COUNT] [--duration 2h] [--all]   append snapshots (JSON Lines)
+mtm summary out.jsonl [--top N] [--json]   steadily growing processes in a recording (leak finder)
 mtm diff a.json b.json      what grew, appeared or went away between snapshots
 ```
+
+Recording size: about 19 KB per snapshot with the default `--top 50` (~14 MB/hour at the default
+5 s interval) and about 120 KB with `--all` (~85 MB/hour). An interrupted recording can be
+appended to; a half-written last line is skipped when reading.
 
 Tip: take both snapshots with `--all` before using `diff`, otherwise processes outside the
 top N look like they appeared or vanished.
