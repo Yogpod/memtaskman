@@ -35,6 +35,10 @@ def system_lines(sm: SystemMemory) -> list[str]:
         lines.append(f"Faults   {fmt_count_rate(sm.page_faults_ps)}/s, hard {fmt_count_rate(sm.hard_faults_ps)}/s")
     for k, v in sm.extra.items():
         lines.append(f"         {k}: {fmt_bytes(v)}")
+    if sm.pressure_level:
+        lines.append(f"Pressure {sm.pressure_level}")
+    if sm.pressure_some is not None:
+        lines.append(f"Pressure some {sm.pressure_some:.1f}%, full {sm.pressure_full or 0:.1f}% (PSI avg10)")
     if sm.vm_note:
         lines.append(f"Note     {sm.vm_note}")
     return lines

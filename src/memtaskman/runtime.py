@@ -38,6 +38,16 @@ _BROWSERS = {
     "arc": "Arc",
 }
 
+_MAC_BROWSERS = {
+    "google chrome": "Chrome",
+    "brave browser": "Brave",
+    "microsoft edge": "Edge",
+    "arc": "Arc",
+    "vivaldi": "Vivaldi",
+    "opera": "Opera",
+    "chromium": "Chromium",
+}
+
 _VM_HOSTS = {
     "vmmem": "Hyper-V / WSL2 guest RAM",
     "vmmemwsl": "WSL2 guest RAM",
@@ -114,12 +124,27 @@ def detect(exe: str, modules: Iterable[str] = (), cmdline: Iterable[str] = ()) -
     if name in {"system", "registry", "secure system", "kernel_task", "kthreadd"}:
         return RuntimeInfo("Kernel", "", [(IDENTIFIED, "kernel / system process")])
 
+    # --- macOS app bundles: "Google Chrome Helper (Renderer)", "Brave Browser Helper (GPU)" -----
+    mac_brand = next((b for app, b in _MAC_BROWSERS.items() if name == app or name.startswith(app + " helper")), None)
+    if name in ("com.apple.webkit.webcontent", "com.apple.webkit.gpu", "com.apple.webkit.networking", "safari"):
+        kind = {"com.apple.webkit.webcontent": "web content", "com.apple.webkit.gpu": "gpu",
+                "com.apple.webkit.networking": "network"}.get(name, "browser")
+        return RuntimeInfo("Safari", kind, [(IDENTIFIED, "WebKit process")])
+    if name == "windowserver":
+        return RuntimeInfo("macOS", "WindowServer", [(IDENTIFIED, "compositor: window and display buffers")])
+    if name in ("mds_stores", "mds", "mdworker_shared"):
+        return RuntimeInfo("macOS", "Spotlight", [(IDENTIFIED, "Spotlight indexing")])
+    if name == "com.apple.virtualization.virtualmachine":
+        return RuntimeInfo("VM", "Virtualization.framework guest RAM",
+                           [(IDENTIFIED, "Docker Desktop / UTM / OrbStack / Lima guest")])
+
     # --- Browsers & Electron (Chromium multi-process model) -------------------------
     ptype = _flag(args, "--type")
     chromium_mod = _has_module(mods, r"chrome_elf\.dll", r"chrome\.dll", r"msedge\.dll", r"libcef\.(dll|so)",
-                               r"msedge_elf\.dll", r"electron.*")
-    if ptype or chromium_mod or name in _BROWSERS:
-        brand = _BROWSERS.get(name)
+                               r"msedge_elf\.dll", r"electron.*", r"chromium embedded framework",
+                               r"google chrome framework", r"brave browser framework", r"microsoft edge framework")
+    if ptype or chromium_mod or name in _BROWSERS or mac_brand:
+        brand = _BROWSERS.get(name) or mac_brand
         if brand is None:
             brand = "Electron" if (ptype or chromium_mod) else "Chromium"
         sub = _flag(args, "--utility-sub-type")
@@ -169,7 +194,7 @@ def detect(exe: str, modules: Iterable[str] = (), cmdline: Iterable[str] = ()) -
             ev.append((IDENTIFIED, "WPF UI"))
         return RuntimeInfo(flavour, "", ev)
 
-    node = _has_module(mods, r"libnode\.(dll|so.*|dylib)", r"node\.dll")
+    node = _has_module(mods, r"libnode\.(dll|so.*|dylib)", r"node\.dll", r"libnode\.\d+\.dylib")
     if node or name in {"node", "bun", "deno"}:
         label = {"bun": "Bun", "deno": "Deno"}.get(name, "Node.js")
         ev = [(IDENTIFIED, f"{label} ({node or exe})")]
@@ -179,7 +204,7 @@ def detect(exe: str, modules: Iterable[str] = (), cmdline: Iterable[str] = ()) -
         script = next((a for a in args[1:] if not a.startswith("-")), "")
         return RuntimeInfo(label, PurePath(script.replace("\\", "/")).name if script else "", ev)
 
-    py = _has_module(mods, r"python3\d*\.dll", r"libpython3[\d.]*\.(so.*|dylib)")
+    py = _has_module(mods, r"python3\d*\.dll", r"libpython3[\d.]*\.(so.*|dylib)", r"python")
     if py or re.fullmatch(r"pythonw?(3(\.\d+)?)?", name):
         ver = ""
         if py:
@@ -192,7 +217,9 @@ def detect(exe: str, modules: Iterable[str] = (), cmdline: Iterable[str] = ()) -
             if i + 1 < len(args):
                 script = args[i + 1]
         ev = [(IDENTIFIED, f"CPython {ver}".strip() + (f" ({py})" if py else ""))]
-        if _has_module(mods, r"torch_cpu\.dll", r"libtorch_cpu\.so", r"c10\.dll"):
+        if _has_module(mods, r"libmlx\.dylib"):
+            ev.append((IDENTIFIED, "MLX loaded (Apple silicon unified memory: GPU tensors count here)"))
+        if _has_module(mods, r"torch_cpu\.dll", r"libtorch_cpu\.(so|dylib)", r"c10\.dll"):
             ev.append((IDENTIFIED, "PyTorch loaded (tensors on CPU count as private bytes)"))
         return RuntimeInfo(f"Python {ver}".strip(), PurePath(script.replace("\\", "/")).name if script else "", ev)
 

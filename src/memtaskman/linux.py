@@ -312,6 +312,9 @@ def cgroup_stats(kind: str, path: str) -> dict | None:
     }
 
 
+module_names = mapped_paths  # same interface as win32 / macos
+
+
 def inspect(pid: int, name: str, *, top_files: int = 12) -> Inspection:
     t0 = time.perf_counter()
     ins = Inspection(pid=pid, name=name)

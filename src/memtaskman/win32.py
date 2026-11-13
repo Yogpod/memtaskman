@@ -361,7 +361,6 @@ def _walk_regions(h) -> list[tuple[int, int, int, int, int, int]]:
 
 def _working_set(h) -> list[int] | None:
     """Raw PSAPI_WORKING_SET_BLOCK values, or None on failure."""
-    ptr = ctypes.sizeof(ctypes.c_size_t)
     count = 4096
     for _ in range(6):
         buf = (ctypes.c_size_t * (count + 1))()

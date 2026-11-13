@@ -16,7 +16,7 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Sparkline, Static
 
-from memtaskman.collector import LINUX, WINDOWS, Collector, group_by_app, sort_procs, unique_column
+from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, group_by_app, sort_procs, unique_column
 
 UNIQUE = unique_column()
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact
@@ -45,6 +45,8 @@ CHARTS = [
 ]
 if LINUX:  # zswap is often off; memory pressure (PSI) is the better Linux signal
     CHARTS[3] = ("pressure", "Memory pressure (PSI some %)", "pct")
+if MACOS:  # macOS has no commit charge; wired memory is the more useful series
+    CHARTS[1] = ("wired", "Wired", "bytes")
 GROUP_MODES = ["none", "app"] + (["cgroup"] if LINUX else [])
 
 LEVEL_STYLE = {MEASURED: "green", DERIVED: "cyan", IDENTIFIED: "magenta", HINT: "yellow"}
@@ -120,6 +122,12 @@ def stacked_bar(segments: list[tuple[str, int, str]], total: int, width: int) ->
 
 
 def ram_segments(sm: SystemMemory) -> list[tuple[str, int, str]]:
+    if "App memory" in sm.extra:  # macOS, Activity Monitor's split
+        used = sm.extra["App memory"] + sm.extra.get("Wired", 0) + (sm.compressed or 0)
+        cached = min(sm.cached or 0, max(0, sm.total - used))
+        free = max(0, sm.total - used - cached)
+        return [("App", sm.extra["App memory"], C_USED), ("Wired", sm.extra.get("Wired", 0), C_MOD),
+                ("Compressed", sm.compressed or 0, C_COMMIT), ("Cached files", cached, C_STANDBY), ("Free", free, C_FREE)]
     if sm.standby is not None:  # Windows
         mod = sm.modified or 0
         in_use = max(0, sm.used - mod)
@@ -261,13 +269,14 @@ class MemTaskManApp(App):
             "cache": sm.standby if sm.standby is not None else sm.cached,
             "compressed": sm.compressed,
             "pressure": sm.pressure_some,
+            "wired": sm.kernel_nonpaged,
             "swap": sm.swap_used,
             "kernel": (sm.kernel_paged or 0) + (sm.kernel_nonpaged or 0) if sm.kernel_paged is not None else None,
             "faults": sm.page_faults_ps,
             "hard": sm.hard_faults_ps,
         }
         for k, v in vals.items():
-            if v is not None:
+            if v is not None and k in self.history:  # only series that have a chart on this platform
                 self.history[k].append(float(v))
 
     # ------------------------------------------------------------------ rendering
@@ -286,6 +295,9 @@ class MemTaskManApp(App):
             full = sm0.pressure_full or 0.0
             style = "bold red" if full >= 5 else "yellow" if sm0.pressure_some >= 5 else "dim"
             status.append(f"  pressure some {sm0.pressure_some:.1f}% full {full:.1f}%", style=style)
+        if sm0 and sm0.pressure_level:
+            style = {"warn": "bold yellow", "critical": "bold red"}.get(sm0.pressure_level, "dim")
+            status.append(f"  memory pressure: {sm0.pressure_level}", style=style)
         if self.paused:
             status.append("  PAUSED", style="bold yellow")
         lines.append(status)

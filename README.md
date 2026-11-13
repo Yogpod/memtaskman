@@ -12,8 +12,9 @@ modified pages, the compression store, kernel pools and commit charge.
 
 Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does the same for VRAM.
 
-> Early, experimental software. Windows is the primary target, Linux is supported (tested on Ubuntu under WSL2), macOS
-> gets the basic psutil view without the address-space inspector.
+> Early, experimental software. Windows is the primary target, Linux is supported (tested on Ubuntu under WSL2).
+> macOS support (footprint, compression, memory pressure, and a vmmap-style inspector) is new and
+> **not yet validated on a real Mac**; it's checked by CI on Apple silicon runners.
 
 ## What you get
 
@@ -39,6 +40,12 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
   the VM, plus `.wslconfig` limit and reclaim hints. It's read on demand and only when a distro
   is already running, because polling would keep WSL from shutting down when idle. Disable it
   with `--no-host`. Inside WSL, the Linux view notes that its RAM is really `vmmemWSL` on the host.
+- **macOS**: an Activity Monitor-style RAM bar (App / Wired / Compressed / Cached files / Free),
+  memory pressure level (normal / warn / critical), a **Footprint** column (Activity Monitor's
+  "Memory", which includes compressed memory and, on Apple silicon, GPU memory), and an inspector
+  that walks regions like `vmmap`. It splits malloc heaps, stacks, **Graphics / GPU** (IOKit,
+  IOSurface, IOAccelerator, CoreAnimation), **JIT / JavaScript**, dylibs plus the dyld shared
+  cache (counted once), and mapped files.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
 - **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
   session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
@@ -139,6 +146,10 @@ top N look like they appeared or vanished.
 | `GetMappedFileName` | Windows | which file backs each image/mapped region |
 | `QueryWorkingSet` | Windows | every resident page and its shared bit, attributed back to regions |
 | `EnumProcessModulesEx` | Windows | loaded DLLs for runtime identification |
+| `host_statistics64(HOST_VM_INFO64)` | macOS | app / wired / compressed / cached / free pages, faults, page-ins |
+| `sysctl` `vm.pagesize`, `kern.memorystatus_vm_pressure_level` | macOS | page size (16 KB on Apple silicon), memory pressure |
+| `proc_pid_rusage(RUSAGE_INFO_V4)` | macOS | physical footprint and lifetime peak per process |
+| `proc_pidinfo(PROC_PIDTASKINFO / PROC_PIDREGIONPATHINFO)` | macOS | fault counts; per-region tag, share mode, resident / shared / swapped pages, backing file |
 | `/proc/meminfo`, `/proc/vmstat` | Linux | cache, dirty, slab, zswap, commit, fault rates |
 | `/proc/<pid>/status`, `stat` | Linux | RssAnon / RssFile / RssShmem, VmSwap, VmHWM, faults |
 | `/proc/pressure/memory` | Linux | memory pressure stall information (PSI) |

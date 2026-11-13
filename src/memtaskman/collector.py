@@ -25,12 +25,15 @@ from memtaskman.model import (
 
 WINDOWS = sys.platform == "win32"
 LINUX = sys.platform.startswith("linux")
+MACOS = sys.platform == "darwin"
 
 if WINDOWS:
     from memtaskman import win32 as native
 elif LINUX:
     from memtaskman import linux as native
-else:  # macOS & others: psutil only
+elif MACOS:
+    from memtaskman import macos as native
+else:  # other platforms: psutil only
     native = None
 
 GROWTH_ALPHA = 0.35  # EMA weight for the private-bytes growth rate
@@ -58,6 +61,8 @@ def private_label() -> str:
         return "Private"  # private commit charge (Task Manager "Commit size")
     if LINUX:
         return "Anon"  # resident anonymous memory (RssAnon)
+    if MACOS:
+        return "Footprint"  # phys_footprint: Activity Monitor's "Memory" (incl. compressed + GPU)
     return "Private"
 
 
@@ -149,6 +154,12 @@ class Collector:
                 p.nonpaged_pool = getattr(mi, "nonpaged_pool", None)
                 faults = getattr(mi, "num_page_faults", None)
                 p.uss = private_ws.get(pid)
+            elif MACOS:
+                ru = native.rusage(pid)
+                if ru:
+                    p.private = ru["footprint"]
+                    p.peak = ru["peak"]
+                faults = native.task_faults(pid)
             elif LINUX:
                 st = native.proc_status(pid)
                 if "RssAnon" in st:
@@ -208,6 +219,8 @@ class Collector:
             self._system_windows(sm, procs)
         elif LINUX:
             self._system_linux(sm, now)
+        elif MACOS:
+            self._system_macos(sm, now)
         else:
             sm.free = getattr(vm, "free", None)
             sm.cached = getattr(vm, "inactive", None)
@@ -257,6 +270,32 @@ class Collector:
         if comp is not None:
             sm.compressed = comp.resident
         self._first = False
+
+    def _system_macos(self, sm: SystemMemory, now: float) -> None:
+        sm.source = "host_statistics64 + sysctl"
+        v = native.vm_stats()
+        if v is None:
+            return
+        b = native.vm_breakdown(v, native.page_size())
+        sm.used = b["used"]
+        sm.available = max(0, sm.total - sm.used)
+        sm.free = b["free"]
+        sm.cached = b["cached"]
+        sm.compressed = b["compressed"]
+        sm.kernel_nonpaged = b["wired"]
+        sm.pressure_level = native.pressure_level()
+        sm.extra["App memory"] = b["app"]
+        sm.extra["Wired"] = b["wired"]
+        sm.extra["Purgeable"] = b["purgeable"]
+        if b["compressed_original"]:
+            sm.extra["Compressed (original size)"] = b["compressed_original"]
+        if self._vm_prev:
+            t0, prev = self._vm_prev
+            dt = now - t0
+            if dt > 0:
+                sm.page_faults_ps = (v["faults"] - prev["faults"]) / dt
+                sm.hard_faults_ps = (v["pageins"] - prev["pageins"]) / dt
+        self._vm_prev = (now, v)
 
     def _system_linux(self, sm: SystemMemory, now: float) -> None:
         sm.source = "/proc/meminfo + /proc/vmstat"
@@ -405,7 +444,7 @@ class Collector:
         mods: list[str] = []
         if native is not None and p.pid > 4:
             try:
-                mods = (native.module_names(p.pid) if WINDOWS else native.mapped_paths(p.pid)) or []
+                mods = native.module_names(p.pid) or []
             except OSError:
                 mods = []
         try:

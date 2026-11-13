@@ -17,7 +17,9 @@ import tempfile
 import time
 from pathlib import Path
 
-from memtaskman.collector import LINUX, WINDOWS, Collector, sort_procs
+from memtaskman.collector import LINUX, MACOS, WINDOWS, Collector, sort_procs
+
+NATIVE = WINDOWS or LINUX or MACOS
 
 FAILURES: list[str] = []
 
@@ -38,6 +40,12 @@ def collector_checks() -> None:
     check(me is not None and me.resident > 0, "own process present with resident bytes")
     sm = snap.system
     check(sm is not None and sm.total > 0 and 0 < sm.available <= sm.total, "system total/available sane")
+    if MACOS:
+        check(sm.compressed is not None and sm.extra.get("App memory"), "macOS: app / compressed from host_statistics64")
+        check(sm.pressure_level in ("normal", "warn", "critical"), f"macOS: pressure level {sm.pressure_level}")
+        check(sm.page_faults_ps is not None, "macOS: system fault rate")
+        check(me.private is not None and me.private > 0, "macOS: own footprint via proc_pid_rusage")
+        check(me.faults_ps is not None, "macOS: own fault rate via PROC_PIDTASKINFO")
     if WINDOWS or LINUX:
         check(sm.commit_used is not None and sm.commit_limit, "commit charge reported")
         check(sm.page_faults_ps is not None, "system fault rate reported")
@@ -61,7 +69,7 @@ def collector_checks() -> None:
         check(me.pss is not None and me.pss > 0, "own PSS from smaps_rollup")
 
     ins = c.inspect(me)
-    if WINDOWS or LINUX:
+    if NATIVE:
         check(ins.error is None, f"inspect self: {ins.error or 'no error'}")
         check(len(ins.categories) >= 3, f"inspect self: {len(ins.categories)} categories")
         check(any(c.resident for c in ins.categories), "inspect self: resident bytes attributed")
@@ -69,6 +77,9 @@ def collector_checks() -> None:
         check(py is not None and py.name.startswith("Python"), f"self identified as {py and py.label}")
     else:
         check(ins.error is not None, "inspect reports unsupported platform cleanly")
+    if MACOS:
+        heap = next((c for c in ins.categories if c.name.startswith("Private")), None)
+        check(heap is not None and heap.resident, "macOS: malloc heap resident bytes from region walk")
     c.close()
 
 
@@ -129,7 +140,7 @@ def cli_checks() -> None:
         r = run("summary", str(rec))
         check(r.returncode == 0 and "1 unreadable line" in r.stdout, "mtm summary skips a torn last line")
     r = run("inspect", str(os.getpid()))
-    expected = 0 if (WINDOWS or LINUX) else 2
+    expected = 0 if NATIVE else 2
     check(r.returncode == expected, f"mtm inspect <self> exit {r.returncode}")
 
 

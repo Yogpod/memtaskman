@@ -37,6 +37,7 @@ class SystemMemory:
     hard_faults_ps: float | None = None  # pages read from disk per second
     pressure_some: float | None = None  # Linux PSI: % of time some task stalled on memory (avg10)
     pressure_full: float | None = None  # Linux PSI: % of time all tasks stalled on memory (avg10)
+    pressure_level: str | None = None  # macOS: normal / warn / critical (kern.memorystatus_vm_pressure_level)
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
     vm_note: str | None = None  # e.g. "this is a WSL2 VM" when running inside one
     source: str = "psutil"
@@ -142,4 +143,6 @@ CAT_SHM = "Shared memory"
 CAT_HEAP = "Private (heap/anon)"
 CAT_STACK = "Stacks"
 CAT_OTHER = "Other"
-CATEGORY_ORDER = [CAT_HEAP, CAT_STACK, CAT_IMAGE, CAT_MAPPED, CAT_SHM, CAT_OTHER]
+CAT_GPU = "Graphics / GPU"  # macOS: IOKit, IOSurface, IOAccelerator, CoreAnimation, CoreGraphics
+CAT_JIT = "JIT / JavaScript"  # macOS: JavaScriptCore heap and JIT code
+CATEGORY_ORDER = [CAT_HEAP, CAT_JIT, CAT_GPU, CAT_STACK, CAT_IMAGE, CAT_MAPPED, CAT_SHM, CAT_OTHER]
