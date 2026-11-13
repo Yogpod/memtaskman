@@ -28,6 +28,7 @@ SETTINGS: dict[str, tuple] = {
     "privacy": (False, bool, None, "hide command lines and home-directory paths"),
     "wsl_guest": (True, bool, None, "Windows: read the WSL2 guest's memory when inspecting vmmemWSL"),
     "system": (True, bool, None, "sample system-wide counters"),
+    "read_only": (False, bool, None, "disable ending processes (the k key)"),
 }
 
 

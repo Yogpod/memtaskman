@@ -31,6 +31,7 @@ from memtaskman.collector import (
 )
 
 UNIQUE = unique_column()
+from memtaskman import killer
 from memtaskman import tree as ptree
 from memtaskman.fmt import fmt_bytes, fmt_count_rate, fmt_rate, pct, redact, set_units, units, units_legend
 from memtaskman.model import (
@@ -137,7 +138,11 @@ HELP = f"""\
 [b]Tree[/b] (t) parents with their children. Enter collapses / expands a node; a collapsed node shows
   its subtree's totals (+N = hidden descendants). Nodes with many children start collapsed.
 
-[b]Keys[/b]  t tree  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
+[b]Ending processes[/b] (k) type the name to confirm. The first k asks politely (like closing its
+  windows / SIGTERM); if it's still running, k again force-kills it after a second confirmation.
+  Critical system processes are refused; --read-only (or read_only = true) disables k entirely.
+
+[b]Keys[/b]  k end process  t tree  u units  ↑/↓ select  / filter  s sort (or click a header; again to reverse)  g group (app/cgroup)  a top/all  c charts  m slim  p pause  ? help  q quit
 [dim]Esc to close[/dim]"""
 
 
@@ -161,6 +166,38 @@ def ui_callback(method):
             raise
 
     return wrapper
+
+
+class KillScreen(ModalScreen):
+    """Type the process name to confirm. Returns True / False via dismiss."""
+
+    AUTO_FOCUS = "#kill-name"
+    BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, proc: ProcessMem, force: bool):
+        super().__init__()
+        self.proc = proc
+        self.force = force
+
+    def compose(self) -> ComposeResult:
+        p = self.proc
+        verb = "FORCE-KILL" if self.force else "End"
+        how = ("It gets no chance to save anything (TerminateProcess / SIGKILL)." if self.force else
+               "It is asked to close, as if you closed its windows (taskkill without /F / SIGTERM).")
+        with Vertical(id="kill"):
+            yield Static(f"[b]{verb} {p.name}[/b]  (pid {p.pid}, {fmt_bytes(p.resident)} resident)\n\n{how}\n\n"
+                         f"Type [b]{p.name}[/b] and press Enter to confirm, or Esc to cancel.")
+            yield Input(placeholder=p.name, id="kill-name")
+            yield Static("", id="kill-error")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.value.strip().lower() == self.proc.name.lower():
+            self.dismiss(True)
+        else:
+            self.query_one("#kill-error", Static).update(Text("name doesn't match", style="red"))
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
 
 
 class HelpScreen(ModalScreen):
@@ -230,6 +267,9 @@ class MemTaskManApp(App):
     #filter { display: none; height: 3; margin: 0 1; }
     #filter.visible { display: block; }
     HelpScreen { align: center middle; }
+    KillScreen { align: center middle; }
+    #kill { width: 76; max-width: 95%; height: auto; border: heavy $error; background: $surface; padding: 1 2; }
+    #kill-error { height: 1; }
     #help { width: 100; max-width: 95%; height: 80%; border: round $accent; background: $surface; padding: 1 2; }
     """
     BINDINGS = [
@@ -243,6 +283,7 @@ class MemTaskManApp(App):
         Binding("slash", "filter", "Filter", key_display="/"),
         Binding("u", "units", "Units", show=False),
         Binding("t", "tree", "Tree"),
+        Binding("k", "kill", "End process"),
         Binding("question_mark", "help", "Help", key_display="?"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
     ]
@@ -263,6 +304,8 @@ class MemTaskManApp(App):
         self.tree_mode = bool(settings.get("tree", False))
         self.top_n = int(settings.get("top", TOP_N))
         self.start_slim = bool(settings.get("slim", False))
+        self.read_only = bool(settings.get("read_only", False))
+        self.polite_sent: dict[tuple, float] = {}  # process key -> when a polite close was requested
         self.tree_collapsed: set = set()  # explicit user choices, by process key
         self.tree_expanded: set = set()
         self.tree_rows: dict[str, ptree.TreeRow] = {}
@@ -799,6 +842,48 @@ class MemTaskManApp(App):
         self.notify(f"sort: {self.sort_key}", timeout=1.5)
         self._update_header_arrows()
         self._refresh_now()
+
+    def check_action(self, action: str, parameters) -> bool | None:
+        if action == "kill" and self.read_only:
+            return False  # hidden from the footer and inert
+        return True
+
+    def _selected_process(self) -> ProcessMem | None:
+        """The real process under the cursor (not a tree subtree total or a group)."""
+        row = self.rows.get(self.selected) if self.selected else None
+        if row is None or self.snapshot is None or self.group_mode != "none":
+            return row
+        return next((q for q in self.snapshot.processes if q.key == row.key), row)
+
+    def action_kill(self) -> None:
+        p = self._selected_process()
+        if p is None:
+            self.notify("select a process first", severity="warning")
+            return
+        why = killer.refuse_reason(p)
+        if why:
+            self.notify(f"won't end it: {why}", severity="warning", timeout=4)
+            return
+        force = time.monotonic() - self.polite_sent.get(p.key, -1e9) < 120
+
+        def done(confirmed: bool | None) -> None:
+            if confirmed:
+                self.kill_worker(p, force)
+
+        self.push_screen(KillScreen(p, force), done)
+
+    @work(thread=True, group="kill")
+    def kill_worker(self, p: ProcessMem, force: bool) -> None:
+        sent, msg = killer.end_process(p, force=force)
+        if not force and not sent and "polite" in msg:
+            self.polite_sent[p.key] = time.monotonic()  # next k forces
+        self.call_from_thread(self.notify, msg, severity="information" if sent else "warning", timeout=4)
+        if sent and not force:
+            self.polite_sent[p.key] = time.monotonic()
+            time.sleep(3)
+            if isinstance(killer.verify(p), killer.psutil.Process):
+                self.call_from_thread(self.notify, f"{p.name} is still running; press k again to force it",
+                                      severity="warning", timeout=6)
 
     def action_tree(self) -> None:
         self.tree_mode = not self.tree_mode

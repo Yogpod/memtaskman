@@ -172,6 +172,7 @@ table, but some of their values show `-`, and the inspector explains why. For th
 | Key        | Action                                   |
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
+| `k`        | end the selected process: type its name to confirm; polite first, `k` again to force (disabled by `--read-only`) |
 | `t`        | process tree (Enter collapses / expands; collapsed rows show subtree totals) |
 | `u`        | binary (GiB) / decimal (GB) units |
 | `/`        | filter by name, runtime or PID (Enter keeps it, Esc clears) |
@@ -194,6 +195,7 @@ mtm --json [--top N|--all]  print a JSON snapshot and exit
 mtm --no-system             skip system-wide counters
 mtm --sort growth --tree     initial sort / view (also --group app|cgroup, --slim)
 mtm --print-config          effective settings (config file + flags) as TOML
+mtm --read-only             disable ending processes (also read_only = true in the config)
 mtm --units decimal         1G = 1 GB (10⁹ bytes) instead of 1 GiB; JSON always stays in bytes
 mtm --once --filter brave   only processes matching a name, runtime or PID (also --json, record)
 mtm --no-host               don't read the WSL2 guest's memory when inspecting vmmemWSL
@@ -256,6 +258,9 @@ Caveats:
 
 - memtaskman reads memory **metadata** (sizes, page states, mapped file names), never the
   contents of another process's memory. Model files are read up to their GGUF header only.
+- Read-only except for one deliberate action: `k` ends a process, only after you type its name,
+  never for critical system processes, and only if the PID still belongs to the same process.
+  `--read-only` removes it.
 - No telemetry. The only network request is an optional `GET /api/ps` to an Ollama server on
   localhost, made only while you inspect an Ollama process.
 - `--json`, `record` and `inspect` output contain process names, command lines, file paths

@@ -205,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--group", choices=["none", "app", "cgroup"], help="initial grouping")
     p.add_argument("--tree", action="store_true", help="start in the process tree view")
     p.add_argument("--slim", action="store_true", help="start in slim mode")
+    p.add_argument("--read-only", action="store_true", help="disable ending processes (the k key)")
     p.add_argument("--print-config", action="store_true",
                    help="show the effective settings (config file + flags) as TOML and exit")
     p.add_argument("--self-test", action="store_true", help=argparse.SUPPRESS)
@@ -271,6 +272,7 @@ def apply_config(args) -> tuple[dict, dict, list[str]]:
         "privacy": True if args.privacy else None,
         "system": False if args.no_system else None,
         "wsl_guest": False if args.no_host else None,
+        "read_only": True if getattr(args, "read_only", False) else None,
     }
     eff, src = config.resolve(cli, file_settings)
     return eff, src, warnings

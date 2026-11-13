@@ -18,7 +18,9 @@ memtaskman's value is that its numbers can be trusted. Every change must keep th
 3. **Read metadata, never contents.** No reading another process's memory. Model files are
    read up to their GGUF header only.
 4. **Don't change what you observe.** No polling that keeps WSL awake, no starting services,
-   no network beyond documented localhost GETs (Ollama `/api/ps`).
+   no network beyond documented localhost GETs (Ollama `/api/ps`). The single exception is `k`
+   (`killer.py`): explicit, typed confirmation, PID + start time re-verified, critical processes
+   refused, polite before forced, and fully disabled by `--read-only`. Keep it that way.
 5. **Shared pages are double counted in per-process sums.** Say so wherever totals are shown
    (group-by-app). Prefer kernel accounting (cgroup `memory.current`, PSS, private working set).
 
