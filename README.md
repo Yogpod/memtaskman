@@ -160,7 +160,7 @@ a unique name that came back under a new PID as `restarted`, and hides changes u
 in text output (`--json` keeps everything).
 
 Tip: take both snapshots with `--all` before using `diff`, otherwise processes outside the
-top N look like they appeared or vanished.
+top N can only be reported as `not listed`.
 
 ## How it measures
 
