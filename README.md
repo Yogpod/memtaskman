@@ -125,8 +125,17 @@ The layout adapts to the terminal: below 150 columns the system panel and inspec
 the table, less important columns are dropped as space runs out, and charts are hidden below 36
 rows. It's usable down to 80×24; the full view wants about 190 columns.
 
-Run from an elevated terminal (or as root on Linux) to inspect processes owned by other users
-and services; otherwise those show "access denied" in the inspector but still appear in the table.
+### Permissions
+
+memtaskman works without admin rights. Other users' and services' processes still appear in the
+table, but some of their values show `-`, and the inspector explains why. For the full picture:
+
+- **Windows:** run from an elevated terminal. Protected processes (anti-malware, `System`) stay
+  partly hidden even then.
+- **Linux:** run with `sudo` for other users' PSS, `smaps` and `/proc/slabinfo`.
+- **macOS:** run with `sudo` for other users' footprint and region walk. System Integrity
+  Protection still blocks some Apple system processes even as root; memtaskman never asks for
+  debugger permissions (`task_for_pid`).
 
 ## Keys
 
@@ -205,6 +214,33 @@ Caveats:
 - The compression store is reported as the working set of the `MemCompression` process.
 - The inspector walk takes ~0.1-1 s for very large processes; it runs in the background and
   refreshes every 5 seconds.
+- macOS *Footprint* includes compressed memory and, on Apple silicon, GPU allocations, so it
+  can exceed *Resident*. That is intended: it's what Activity Monitor calls Memory.
+
+## Privacy
+
+- memtaskman reads memory **metadata** (sizes, page states, mapped file names), never the
+  contents of another process's memory. Model files are read up to their GGUF header only.
+- No telemetry. The only network request is an optional `GET /api/ps` to an Ollama server on
+  localhost, made only while you inspect an Ollama process.
+- `--json`, `record` and `inspect` output contain process names, command lines, file paths
+  (including your home directory) and model names. **Redact before sharing.**
+- `--privacy` hides command lines and shows home directories as `~` in the interface, for
+  screenshots and screen sharing. Process names stay visible.
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| Many `-` values for other users' processes | Expected without admin/root; the inspector says why. Run elevated / with `sudo`. |
+| Inspector says "access denied" | Same as above; protected Windows processes stay hidden even when elevated. |
+| No PSS column values on Linux | PSS is read for visible rows only, every 2 s; other users' rows need `sudo`. |
+| Standby/modified missing on Windows | PDH counters disabled or corrupted: `lodctr /r` from an elevated prompt. |
+| Memory pressure shows `-` on Linux | Kernel without PSI (`CONFIG_PSI`), or booted with `psi=0`. |
+| `vmmemWSL` inspector has no guest view | No distro is running (memtaskman never starts WSL), or `--no-host` was given. |
+| Leak marker never appears | It needs at least 2 minutes of steady growth of 16 MiB and 5%; use `record` + `summary` for slow leaks. |
+| Layout cramped or columns missing | Columns are dropped as width shrinks; the full view wants ~190 columns, or press `m` for slim mode. |
+| Ollama model split not shown | Ollama's API isn't on localhost (`OLLAMA_HOST`), or the server isn't running. |
 
 ## Development
 
@@ -226,17 +262,23 @@ Layout:
 ```
 src/memtaskman/
   app.py        Textual TUI
-  cli.py        argument parsing, --once / --json / inspect / record / diff
-  collector.py  sampling, growth & fault rates, runtime cache, group-by-app
-  win32.py      ctypes: PDH, GetPerformanceInfo, VirtualQueryEx, QueryWorkingSet, modules
-  linux.py      /proc parsers (pure) and readers
+  cli.py        argument parsing, --once / --json / inspect / record / summary / diff
+  collector.py  sampling, rates, leak series, runtime cache, cgroups, unavailable reasons
+  win32.py      Windows ctypes: PDH, GetPerformanceInfo, VirtualQueryEx, QueryWorkingSet, modules
+  linux.py      /proc and cgroup parsers (pure) and readers
+  macos.py      macOS ctypes: host_statistics64, proc_pid_rusage, region walk
+  wslhost.py    the WSL2 guest's view of vmmemWSL, on demand
+  models.py     GGUF header parser, Ollama /api/ps
   runtime.py    runtime identification from modules + command line (pure)
+  leaks.py      trend fitting, leak rule, recording summary (pure)
+  diff.py       snapshot comparison (pure)
   model.py      dataclasses shared by everything
   report.py     text / JSON output
-  diff.py       snapshot comparison
-  fmt.py        byte & rate formatting
+  fmt.py        byte & rate formatting, redaction
 tests/          hardware-independent unit tests
-tools/smoke.py  end-to-end check against the live machine (used by CI)
+tools/          smoke.py (live end-to-end check, used by CI), capture_screenshots.py
+
+See AGENTS.md for the evidence rules every change must follow, and CONTRIBUTING.md.
 ```
 
 ## License

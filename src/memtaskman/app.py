@@ -92,7 +92,14 @@ HELP = f"""\
               over at least 2 minutes of the last 10. GC sawtooth patterns are not flagged.
               For long runs: mtm record out.jsonl, then mtm summary out.jsonl
   Faults/s    page faults per second (soft + hard)
+  Footprint   macOS: Activity Monitor's "Memory". Private memory incl. compressed pages and,
+              on Apple silicon, GPU allocations, so it can exceed Resident
   Pool/Swap   Windows: kernel pool charged to the process / Linux: swapped-out bytes
+
+[b]macOS system bar[/b] App (anonymous) / Wired (kernel, can't be paged or compressed) /
+  Compressed (compressor pool) / Cached files (reclaimable) / Free.
+  Memory pressure normal / warn / critical is the kernel's own verdict, the same as
+  Activity Monitor's pressure graph.
 
 [b]Inspector[/b] walks the selected process's address space:
   Images      exe/DLL/.so code+data, mostly shared with other processes
