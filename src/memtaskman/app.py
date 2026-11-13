@@ -13,6 +13,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Input, Sparkline, Static
 
@@ -122,6 +123,28 @@ HELP = f"""\
 [dim]Esc to close[/dim]"""
 
 
+def ui_callback(method):
+    """For updates posted from worker threads: skip them once the app is shutting down.
+
+    A sample or inspection can finish just after the user quits; its widgets are gone by
+    then, and drawing into them must not turn a clean exit into a traceback.
+    """
+    import functools
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._shutting_down:
+            return None
+        try:
+            return method(self, *args, **kwargs)
+        except NoMatches:
+            if self._shutting_down or not self.is_running or not self.query("#procs"):
+                return None  # widgets already torn down: the app is exiting
+            raise
+
+    return wrapper
+
+
 class HelpScreen(ModalScreen):
     BINDINGS = [Binding("escape,question_mark,q", "app.pop_screen", "Close")]
 
@@ -224,6 +247,7 @@ class MemTaskManApp(App):
         self.selected: str | None = None
         self.last_inspect = 0.0
         self.inspection: Inspection | None = None
+        self._shutting_down = False
 
     # ------------------------------------------------------------------ layout
     @property
@@ -272,7 +296,7 @@ class MemTaskManApp(App):
         self._apply_size(self.size.width, self.size.height)
         self._setup_columns()
         self.set_interval(self.interval, self.tick)
-        self.tick()
+        self.call_after_refresh(self.tick)  # first sample once the widgets are on screen
 
     def _setup_columns(self) -> None:
         t = self.query_one("#procs", DataTable)
@@ -312,6 +336,7 @@ class MemTaskManApp(App):
         self.collector.refresh_pss(visible, time_budget=0.2)
         self.call_from_thread(self.apply, snap)
 
+    @ui_callback
     def apply(self, snap: Snapshot) -> None:
         self.snapshot = snap
         if snap.system:
@@ -548,6 +573,7 @@ class MemTaskManApp(App):
         self.last_inspect = time.monotonic()
         self.inspect_worker(target, p.count)
 
+    @ui_callback
     def show_cgroup(self, row: ProcessMem) -> None:
         parts: list = []
         head = Text()
@@ -610,6 +636,7 @@ class MemTaskManApp(App):
         ins = self.collector.inspect(p)
         self.call_from_thread(self.show_inspection, ins, group_count)
 
+    @ui_callback
     def show_inspection(self, ins: Inspection, group_count: int = 1) -> None:
         self.inspection = ins
         parts: list = []
@@ -753,4 +780,5 @@ class MemTaskManApp(App):
         self.push_screen(HelpScreen())
 
     def on_unmount(self) -> None:
+        self._shutting_down = True
         self.collector.close()
