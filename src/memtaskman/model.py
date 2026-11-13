@@ -35,6 +35,8 @@ class SystemMemory:
     kernel_nonpaged: int | None = None  # Win nonpaged pool / Linux unreclaimable slab
     page_faults_ps: float | None = None
     hard_faults_ps: float | None = None  # pages read from disk per second
+    pressure_some: float | None = None  # Linux PSI: % of time some task stalled on memory (avg10)
+    pressure_full: float | None = None  # Linux PSI: % of time all tasks stalled on memory (avg10)
     extra: dict[str, int] = field(default_factory=dict)  # platform-specific labelled values
     source: str = "psutil"
 
@@ -62,6 +64,8 @@ class ProcessMem:
     runtime: str | None = None
     runtime_detail: str | None = None
     count: int = 1  # >1 when this row aggregates several processes (group-by-app view)
+    cgroup: str | None = None  # Linux cgroup path (per process) or the group's path (cgroup rows)
+    cgroup_stats: dict | None = None  # kernel accounting for cgroup rows (memory.current, stat, limits)
 
     @property
     def key(self) -> tuple[int, float]:
@@ -78,6 +82,7 @@ class Snapshot:
     system: SystemMemory | None
     processes: list[ProcessMem]
     private_label: str = "Private"  # what "private" means on this platform
+    cgroups: list[ProcessMem] | None = None  # Linux: one row per cgroup, from kernel accounting
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -87,6 +92,7 @@ class Snapshot:
             "private_label": self.private_label,
             "system": self.system.to_dict() if self.system else None,
             "processes": [p.to_dict() for p in self.processes],
+            "cgroups": [g.to_dict() for g in self.cgroups] if self.cgroups is not None else None,
         }
 
 

@@ -2,7 +2,19 @@
 
 import unittest
 
-from memtaskman.linux import categorize, parse_kb_table, parse_smaps, parse_stat_faults, parse_vmstat, summarize_smaps
+from memtaskman.linux import (
+    categorize,
+    cgroup_label,
+    parse_flat_keyed,
+    parse_kb_table,
+    parse_limit,
+    parse_proc_cgroup,
+    parse_psi,
+    parse_smaps,
+    parse_stat_faults,
+    parse_vmstat,
+    summarize_smaps,
+)
 from memtaskman.model import CAT_HEAP, CAT_IMAGE, CAT_MAPPED, CAT_OTHER, CAT_SHM, CAT_STACK
 
 MEMINFO = """\
@@ -76,6 +88,38 @@ class LinuxParserTests(unittest.TestCase):
         roll = parse_kb_table("Rss: 2048 kB\nPss: 1024 kB\nPrivate_Clean: 100 kB\nPrivate_Dirty: 400 kB\n")
         self.assertEqual(roll["Pss"], 1024 * 1024)
         self.assertEqual(roll["Private_Clean"] + roll["Private_Dirty"], 500 * 1024)
+
+    def test_psi(self):
+        text = ("some avg10=1.50 avg60=0.40 avg300=0.10 total=12345\n"
+                "full avg10=0.25 avg60=0.00 avg300=0.00 total=99\n")
+        psi = parse_psi(text)
+        self.assertEqual(psi["some"]["avg10"], 1.5)
+        self.assertEqual(psi["full"]["total"], 99)
+        self.assertEqual(parse_psi(""), {})
+
+    def test_flat_keyed_and_limits(self):
+        self.assertEqual(parse_flat_keyed("anon 4096\nfile 8192\nbogus x\n"), {"anon": 4096, "file": 8192})
+        self.assertIsNone(parse_limit("max\n"))
+        self.assertIsNone(parse_limit(None))
+        self.assertEqual(parse_limit("2147483648\n"), 2 * 1024**3)
+        self.assertIsNone(parse_limit("9223372036854771712"))  # cgroup v1 "unlimited"
+
+    def test_proc_cgroup(self):
+        self.assertEqual(parse_proc_cgroup("0::/system.slice/nginx.service\n"), ("v2", "/system.slice/nginx.service"))
+        v1 = "12:cpu,cpuacct:/a\n9:memory:/docker/abc\n1:name=systemd:/x\n"
+        self.assertEqual(parse_proc_cgroup(v1), ("v1", "/docker/abc"))
+        self.assertIsNone(parse_proc_cgroup(""))
+
+    def test_cgroup_labels(self):
+        cid = "a" * 64
+        self.assertEqual(cgroup_label("/"), "(root cgroup)")
+        self.assertEqual(cgroup_label("/system.slice/nginx.service"), "nginx.service")
+        self.assertEqual(cgroup_label(f"/system.slice/docker-{cid}.scope"), "docker:aaaaaaaaaaaa")
+        self.assertEqual(cgroup_label("/user.slice/user-1000.slice/session-2.scope"), "session-2.scope (user-1000)")
+        self.assertEqual(cgroup_label("/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox@123.scope"),
+                         "firefox")
+        pod = "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod12345678_aaaa.slice/cri-containerd-" + cid + ".scope"
+        self.assertEqual(cgroup_label(pod), "pod:12345678/aaaaaaaaaaaa")
 
     def test_smaps_summary(self):
         maps = parse_smaps(SMAPS)

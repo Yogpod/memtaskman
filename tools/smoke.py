@@ -51,6 +51,12 @@ def collector_checks() -> None:
     n = c.resolve_runtimes(sort_procs(snap.processes, "resident")[:30], time_budget=5.0)
     check(n > 0, f"runtime identification ran for {n} processes")
     if LINUX:
+        check(sm.pressure_some is not None, f"memory pressure (PSI) some={sm.pressure_some}")
+        check(bool(snap.cgroups), f"{len(snap.cgroups or [])} cgroup rows")
+        mine = next((g for g in snap.cgroups or [] if g.cgroup == me.cgroup), None)
+        check(mine is not None and mine.count >= 1, f"own cgroup row: {mine and mine.name}")
+        accounted = [g for g in snap.cgroups or [] if g.cgroup_stats]
+        check(bool(accounted), f"{len(accounted)} cgroups with kernel accounting")
         c.refresh_pss([me], time_budget=2.0)
         check(me.pss is not None and me.pss > 0, "own PSS from smaps_rollup")
 
@@ -81,6 +87,14 @@ async def tui_checks() -> None:
             await pilot.press(key)
             await pilot.pause(0.6)
         check(app.grouped and app.show_all and app.paused, "TUI toggles respond")
+        if LINUX:
+            await pilot.press("p")  # resume
+            await pilot.press("g")
+            await pilot.pause(1.5)
+            check(app.group_mode == "cgroup" and table.row_count > 0, f"cgroup view: {table.row_count} rows")
+            await pilot.press("down")
+            await pilot.pause(0.5)
+            await pilot.press("p")
         await pilot.press("question_mark")
         await pilot.pause(0.3)
         await pilot.press("escape")

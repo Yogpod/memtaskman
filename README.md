@@ -26,10 +26,20 @@ Inspired by [gputaskman](https://github.com/shanselman/gputaskman), which does t
 - **Process table**: resident (working set / RSS), private commit (Windows) or anonymous
   resident (Linux), a smoothed **growth rate** (a steadily positive number is what a leak
   looks like), page faults/s, kernel pool or swap, and the identified **runtime**.
+  On Windows a **PrivWS** column shows the private working set, which is Task Manager's "Memory"
+  number, for every process from a single PDH query.
   On Linux there is also a **PSS** column (resident memory with shared pages split fairly
   between the processes sharing them, so the column sums to real RAM use), read from
   `smaps_rollup` for the visible rows only. Other users' processes show `-` unless you run as root.
 - **Group by app** (`g`): every `chrome.exe`/`brave.exe`/`Discord.exe` summed into one row.
+- **Group by cgroup** (`g` again, Linux): one row per systemd service, container, pod or login
+  session, sized by the kernel's own cgroup accounting (`memory.current`, so shared pages are
+  counted once), with anon / file / shmem / kernel breakdown, `memory.max` limits, OOM kills and
+  per-cgroup memory pressure in the inspector.
+- **Memory pressure** (Linux PSI): the percentage of time tasks stalled waiting for memory,
+  shown in the status line and as a chart. It's a better out-of-memory signal than "% used".
+- **Standby by priority** (Windows): the standby cache split into reserve, normal and core,
+  in the order Windows reuses them.
 - **Inspector** for the selected process, built from a page-level walk of its address space:
 
   | Category            | Meaning                                                           |
@@ -79,7 +89,7 @@ and services; otherwise those show "access denied" in the inspector but still ap
 |------------|------------------------------------------|
 | ↑ / ↓      | select a process and inspect it          |
 | `s`        | cycle sort: resident, PSS (Linux), private, growth, faults, name, pid |
-| `g`        | group processes by executable            |
+| `g`        | cycle grouping: per process, by app, by cgroup (Linux) |
 | `a`        | top 50 / all processes                   |
 | `c`        | cycle charts (all, or one metric)        |
 | `m`        | slim mode (table only)                   |
@@ -108,6 +118,7 @@ top N look like they appeared or vanished.
 | Source | Platform | Used for |
 |--------|----------|----------|
 | PDH `\Memory\*` counters | Windows | standby (3 priorities), modified, free+zero, cache, pools, fault rates |
+| PDH `\Process V2(*)\Working Set - Private` | Windows | private working set for every process (falls back to `\Process(*)`) |
 | `GetPerformanceInfo` | Windows | commit charge / limit / peak |
 | `GetProcessMemoryInfo` (via psutil) | Windows | working set, private commit, pools, fault counts |
 | `VirtualQueryEx` | Windows | every region: committed vs reserved, image / mapped / private, stacks (guard pages) |
@@ -116,6 +127,8 @@ top N look like they appeared or vanished.
 | `EnumProcessModulesEx` | Windows | loaded DLLs for runtime identification |
 | `/proc/meminfo`, `/proc/vmstat` | Linux | cache, dirty, slab, zswap, commit, fault rates |
 | `/proc/<pid>/status`, `stat` | Linux | RssAnon / RssFile / RssShmem, VmSwap, VmHWM, faults |
+| `/proc/pressure/memory` | Linux | memory pressure stall information (PSI) |
+| `/proc/<pid>/cgroup`, `/sys/fs/cgroup/**/memory.*` | Linux | cgroup membership, `memory.current`, `memory.stat`, limits, events, per-cgroup pressure (v2; v1 basic) |
 | `/proc/<pid>/smaps_rollup` | Linux | PSS and USS (private clean + dirty) for visible rows, refreshed every 2 s at most |
 | `/proc/<pid>/smaps`, `maps` | Linux | per-mapping Rss / Shared / Swap, loaded libraries |
 

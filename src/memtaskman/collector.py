@@ -80,6 +80,7 @@ class Collector:
         self._runtimes: dict[tuple[int, float], _RuntimeEntry] = {}
         self._pss: dict[tuple[int, float], tuple[float, int, int]] = {}  # key -> (checked, pss, uss)
         self._vm_prev: tuple[float, dict[str, int]] | None = None
+        self._cg_tracks: dict[str, _Track] = {}
         self._first = True
         self._lock = threading.RLock()  # sampling and inspection run on different threads
 
@@ -100,7 +101,10 @@ class Collector:
             cached = self._pss.get(p.key)
             if cached:
                 _t, p.pss, p.uss = cached
-        return Snapshot(now, sys.platform, system, procs, private_label())
+        snap = Snapshot(now, sys.platform, system, procs, private_label())
+        if LINUX:
+            snap.cgroups = self._cgroup_rows(procs, now)
+        return snap
 
     # ------------------------------------------------------------------ processes
     def _processes(self, now: float) -> list[ProcessMem]:
@@ -138,6 +142,9 @@ class Collector:
                 p.swapped = st.get("VmSwap")
                 p.peak = st.get("VmHWM")
                 faults = native.proc_faults(pid)
+                cg = native.proc_cgroup(pid)
+                if cg:
+                    p.cgroup = f"{cg[0]}:{cg[1]}"
             self._rates(p, faults, now)
             seen.add(p.key)
             out.append(p)
@@ -246,6 +253,10 @@ class Collector:
                          ("Zswapped", "Zswapped (uncompressed)")):
             if k in mi:
                 sm.extra[label] = mi[k]
+        psi = native.pressure()
+        if psi:
+            sm.pressure_some = psi.get("some", {}).get("avg10")
+            sm.pressure_full = psi.get("full", {}).get("avg10")
         vs = native.vmstat()
         if self._vm_prev and vs:
             t0, prev = self._vm_prev
@@ -254,6 +265,59 @@ class Collector:
                 sm.page_faults_ps = (vs["pgfault"] - prev["pgfault"]) / dt
                 sm.hard_faults_ps = (vs.get("pgmajfault", 0) - prev.get("pgmajfault", 0)) / dt
         self._vm_prev = (now, vs)
+
+    # ------------------------------------------------------------------ cgroups (Linux)
+    def _cgroup_rows(self, procs: list[ProcessMem], now: float) -> list[ProcessMem]:
+        """One row per leaf cgroup. Sizes come from the kernel's cgroup accounting, so shared
+        pages are charged once (to the cgroup that first touched them), never per member."""
+        members: dict[str, list[ProcessMem]] = {}
+        for p in procs:
+            if p.cgroup:
+                members.setdefault(p.cgroup, []).append(p)
+        rows = []
+        for key, ms in members.items():
+            kind, _, path = key.partition(":")
+            stats = native.cgroup_stats(kind, path)
+            row = ProcessMem(
+                pid=min(m.pid for m in ms), name=native.cgroup_label(path), ppid=0, create_time=0.0,
+                resident=0, private=None, count=len(ms), cgroup=key, cgroup_stats=stats,
+            )
+            if stats:
+                row.resident = stats["current"]
+                row.private = stats.get("anon")
+                row.shared = (stats.get("file") or 0) + (stats.get("shmem") or 0) if stats.get("file") is not None else None
+                row.swapped = stats.get("swap")
+            else:  # root cgroup / unreadable: fall back to member sums (an upper bound)
+                row.resident = sum(m.resident for m in ms)
+                row.private = sum(m.private or 0 for m in ms) if any(m.private is not None for m in ms) else None
+            row.pss = sum(m.pss for m in ms if m.pss is not None) if any(m.pss is not None for m in ms) else None
+            row.faults_ps = sum(m.faults_ps for m in ms if m.faults_ps is not None) if any(m.faults_ps is not None for m in ms) else None
+            row.runtime = next((m.runtime for m in sorted(ms, key=lambda m: -m.resident) if m.runtime), None)
+            basis = row.private if row.private is not None else row.resident
+            tr = self._cg_tracks.get(key)
+            if tr is None:
+                self._cg_tracks[key] = _Track(now, basis, None)
+            elif now - tr.t > 0.05:
+                inst = (basis - tr.private) / (now - tr.t)
+                tr.growth = inst if tr.growth is None else GROWTH_ALPHA * inst + (1 - GROWTH_ALPHA) * tr.growth
+                tr.t, tr.private = now, basis
+                row.growth_ps = tr.growth
+            else:
+                row.growth_ps = tr.growth
+            rows.append(row)
+        for k in list(self._cg_tracks):
+            if k not in members:
+                del self._cg_tracks[k]
+        # Disambiguate identical labels (e.g. /init.scope vs user@1000.service/init.scope).
+        seen: dict[str, int] = {}
+        for r in rows:
+            seen[r.name] = seen.get(r.name, 0) + 1
+        for r in rows:
+            if seen[r.name] > 1:
+                parts = [p for p in r.cgroup.partition(":")[2].split("/") if p]
+                if len(parts) >= 2:
+                    r.name = f"{r.name} ({parts[-2].removesuffix('.service').removesuffix('.slice')})"
+        return rows
 
     # ------------------------------------------------------------------ runtimes
     def resolve_runtimes(self, procs: list[ProcessMem], *, time_budget: float = 0.25) -> int:
