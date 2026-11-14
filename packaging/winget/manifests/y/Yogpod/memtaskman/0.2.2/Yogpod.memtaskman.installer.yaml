@@ -3,8 +3,6 @@ PackageIdentifier: Yogpod.memtaskman
 PackageVersion: 0.2.2
 InstallerType: zip
 NestedInstallerType: portable
-Commands:
-  - mtm
 ReleaseDate: 2026-11-13
 Installers:
   - Architecture: x64
